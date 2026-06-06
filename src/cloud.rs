@@ -24,7 +24,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
     config::{self, AgentPolicyConfig, ProfileConfig, ProjectConfig},
-    env_file, fs_util, logs, project_store, registry, vault,
+    env_file, fs_util, logs, project_store, registry, term, vault,
 };
 
 const CLOUD_DB_VERSION: u32 = 1;
@@ -1045,7 +1045,13 @@ pub fn stop_dev_server(options: CloudDevStopOptions) -> Result<()> {
                 serde_json::to_string_pretty(&json!({ "stopped": 0 }))?
             );
         } else {
-            println!("No Ward local cloud instance is running.");
+            term::emit_header(&term::Header {
+                command: Some("cloud dev stop"),
+                project: "local cloud",
+                path: None,
+                mode: None,
+            });
+            term::info("no local cloud instance running");
         }
         return Ok(());
     };
@@ -1057,7 +1063,13 @@ pub fn stop_dev_server(options: CloudDevStopOptions) -> Result<()> {
             serde_json::to_string_pretty(&json!({ "stopped": 1, "pid": instance.pid }))?
         );
     } else {
-        println!("Stopped Ward local cloud pid={}", instance.pid);
+        term::emit_header(&term::Header {
+            command: Some("cloud dev stop"),
+            project: "local cloud",
+            path: Some(&instance.db),
+            mode: None,
+        });
+        term::ok_detail("instance stopped", &format!("pid {}", instance.pid));
     }
     Ok(())
 }
@@ -1068,11 +1080,24 @@ pub fn status(json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(&instance)?);
     } else if let Some(instance) = instance {
-        println!("Ward local cloud running: {}", instance.url);
-        println!("DB: {}", instance.db.display());
-        println!("pid={} version={}", instance.pid, instance.version);
+        term::emit_header(&term::Header {
+            command: Some("cloud dev status"),
+            project: "local cloud",
+            path: Some(&instance.db),
+            mode: None,
+        });
+        term::ok_detail("running", &instance.url);
+        term::info_detail("pid", &instance.pid.to_string());
+        term::info_detail("version", &instance.version);
     } else {
-        println!("No Ward local cloud instance is running.");
+        term::emit_header(&term::Header {
+            command: Some("cloud dev status"),
+            project: "local cloud",
+            path: None,
+            mode: None,
+        });
+        term::info("no local cloud instance running");
+        term::next("run: ward cloud dev start");
     }
     Ok(())
 }
@@ -1196,10 +1221,23 @@ fn print_instance(instance: &CloudDevInstance, json_output: bool, reused: bool) 
     if json_output {
         println!("{}", serde_json::to_string_pretty(instance)?);
     } else if reused {
-        println!("Ward local cloud already running: {}", instance.url);
+        term::emit_header(&term::Header {
+            command: Some("cloud dev start"),
+            project: "local cloud",
+            path: Some(&instance.db),
+            mode: None,
+        });
+        term::ok_detail("already running", &instance.url);
+        term::info_detail("pid", &instance.pid.to_string());
     } else {
-        println!("Ward local cloud running: {}", instance.url);
-        println!("DB: {}", instance.db.display());
+        term::emit_header(&term::Header {
+            command: Some("cloud dev start"),
+            project: "local cloud",
+            path: Some(&instance.db),
+            mode: None,
+        });
+        term::ok_detail("running", &instance.url);
+        term::info_detail("pid", &instance.pid.to_string());
     }
     Ok(())
 }

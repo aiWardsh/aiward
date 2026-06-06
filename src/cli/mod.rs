@@ -1668,7 +1668,7 @@ fn setup(options: SetupOptions) -> Result<()> {
     let mut setup_passphrase = None;
     let mut verified_env_keys = None;
     let mut recovery_plaintext = None;
-    term::section("Vault");
+    term::section("vault");
     if source_exists {
         if source_is_locked {
             if !vault_path.exists() {
@@ -1680,7 +1680,7 @@ fn setup(options: SetupOptions) -> Result<()> {
             }
             env_file::lock_env_file(&options.source, &vault_path)?;
             locked_env = true;
-            term::ok("locked .env marker refreshed");
+            term::ok_detail("locked marker", "refreshed");
         } else {
             let passphrase = vault::read_new_passphrase()?;
             term::blank();
@@ -1695,7 +1695,11 @@ fn setup(options: SetupOptions) -> Result<()> {
                 env_file::lock_env_file(&options.source, &vault_path)?;
                 locked_env = true;
             }
-            term::done(sp, ".env encrypted");
+            term::done_detail(
+                sp,
+                "vault encrypted",
+                &format!("{} -> {}", options.source.display(), vault_path.display()),
+            );
         }
     } else if !vault_path.exists() {
         let passphrase = vault::read_new_passphrase()?;
@@ -1709,12 +1713,12 @@ fn setup(options: SetupOptions) -> Result<()> {
         recovery_plaintext = Some(String::new());
         setup_passphrase = Some(passphrase);
         locked_env = true;
-        term::done(sp, "Empty vault encrypted");
+        term::done_detail(sp, "vault encrypted", "empty vault");
     } else {
-        term::ok("encrypted vault found");
+        term::ok_detail("vault encrypted", &term::short_path(&vault_path));
     }
     if locked_env && !source_is_locked {
-        term::ok("locked marker written");
+        term::ok_detail("locked marker", &options.source.display().to_string());
     }
 
     if let Some(env_keys) = verified_env_keys.as_deref() {
@@ -1723,16 +1727,16 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     registry::update_project_vault(&project_config.project, cwd.clone(), vault_path.clone())?;
-    term::section("Project");
-    term::ok(".ward.json ready");
+    term::section("project");
+    term::ok_detail(".ward.json ready", "project policy");
     if let Some(restored) = auto_restored_config.as_ref() {
-        term::ok(&format!(
-            ".ward.json restored from local backup  {}",
-            term::short_path(&restored.backup_path)
-        ));
+        term::ok_detail(
+            ".ward.json restored",
+            &format!("from {}", term::short_path(&restored.backup_path)),
+        );
     }
-    term::ok("project registered");
-    term::ok(".gitignore updated");
+    term::ok_detail("project registered", &project_config.project);
+    term::ok_detail(".gitignore updated", ".env, .env.*, !.env.vault");
     if env_example.is_some() {
         term::ok(".env.example created");
     }
@@ -1777,12 +1781,12 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     let unlock_session = if options.no_unlock {
-        term::section("Session");
-        term::warn("session not started (--no-unlock)");
+        term::section("session");
+        term::warn_detail("session not started", "--no-unlock");
         None
     } else {
         let passphrase = setup_passphrase_final.as_deref().unwrap();
-        term::section("Session");
+        term::section("session");
         let sp = term::spinner("Starting protected session");
         match create_run_unlock_session(
             &project_config.project,
@@ -1793,16 +1797,16 @@ fn setup(options: SetupOptions) -> Result<()> {
         ) {
             Ok(session) => {
                 let expires = session.expires_at.format("%H:%M").to_string();
-                term::done(sp, &format!("unlocked until {}", expires));
+                term::done_detail(sp, "session unlocked", &format!("expires {expires}"));
                 Some(session)
             }
             Err(error) => {
                 if error.to_string().contains("failed to decrypt vault") {
-                    term::warn_step(sp, "protected session failed");
+                    term::warn_step(sp, "session failed");
                     return Err(error);
                 }
-                term::warn_step(sp, &format!("protected session failed: {error}"));
-                term::info("Run `ward unlock` before running protected commands.");
+                term::warn_step_detail(sp, "session failed", &error.to_string());
+                term::next("run: ward unlock");
                 None
             }
         }
@@ -1826,7 +1830,7 @@ fn setup(options: SetupOptions) -> Result<()> {
 
     // Auto-create recovery key using the same PIN/passphrase — no extra prompt.
     if let Some(ref passphrase) = setup_passphrase_final {
-        term::section("Recovery");
+        term::section("recovery");
         let sp = term::spinner("Creating recovery key");
         match recovery::create_recovery_files_with_material(
             &project_config.project,
@@ -1835,9 +1839,10 @@ fn setup(options: SetupOptions) -> Result<()> {
             recovery_plaintext.as_deref(),
         ) {
             Ok(recovery_file) => {
-                term::done(
+                term::done_detail(
                     sp,
-                    &format!("recovery key created  {}", term::short_path(&recovery_file)),
+                    "recovery key created",
+                    &term::short_path(&recovery_file),
                 );
                 project_config.recovery_created = true;
                 let _ = config::write_project_config(&cwd, &project_config, true);
@@ -1865,7 +1870,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                             Ok(out_path) => {
                                 project_config.backup_exported = true;
                                 let _ = config::write_project_config(&cwd, &project_config, true);
-                                term::ok(&format!("backup saved  {}", term::short_path(&out_path)));
+                                term::ok_detail("backup saved", &term::short_path(&out_path));
                                 #[cfg(not(test))]
                                 let _ = std::process::Command::new("open")
                                     .arg("-R")
@@ -1873,43 +1878,37 @@ fn setup(options: SetupOptions) -> Result<()> {
                                     .spawn();
                             }
                             Err(e) => {
-                                term::warn(&format!("backup export failed — {e}"));
-                                term::info("Run `ward recovery export` when ready.");
+                                term::warn_detail("backup export failed", &e.to_string());
+                                term::next("run: ward recovery export");
                             }
                         }
                     } else {
-                        term::info("Run `ward recovery export` when ready.");
+                        term::next("run: ward recovery export");
                     }
                 }
             }
             Err(error) => {
-                term::warn_step(sp, &format!("recovery key creation failed: {error}"));
-                term::info("Run `ward recovery create` manually.");
+                term::warn_step_detail(sp, "recovery key failed", &error.to_string());
+                term::next("run: ward recovery create");
             }
         }
     }
 
     term::blank();
     if unlock_session.is_none() {
-        term::next(&format!(
-            "ward unlock --ttl {}  — restore broker session",
-            options.unlock_ttl
-        ));
+        term::next(&format!("ward unlock --ttl {}", options.unlock_ttl));
     }
     term::blank();
 
     if options.keep_plaintext {
-        term::warn("plaintext env was kept (--keep-plaintext)");
+        term::warn_detail("plaintext env kept", "--keep-plaintext");
     }
-    term::section("Shell");
+    term::section("shell");
     if let Some(rc) = ensure_shell_integration() {
-        term::ok(&format!(
-            "shell integration installed  {}",
-            term::short_path(&rc)
-        ));
+        term::ok_detail("shell integration", &term::short_path(&rc));
         prompt_shell_reload(&rc);
     } else {
-        term::ok("shell integration ready");
+        term::ok_detail("shell integration", "ready");
     }
     Ok(())
 }
@@ -1943,19 +1942,26 @@ fn init_bare(project: Option<String>, force: bool) -> Result<()> {
     let env_example = config::ensure_env_example(&cwd)?;
     let agent_instructions = config::ensure_agent_instructions(&cwd, &config.project)?;
 
-    println!("Created {}", config_path.display());
+    term::emit_header(&term::Header {
+        command: Some("init"),
+        project: &config.project,
+        path: Some(&cwd),
+        mode: None,
+    });
+    term::ok_detail(".ward.json ready", &term::short_path(&config_path));
     if let Some(path) = env_example {
-        println!("Created or updated {}", path.display());
+        term::ok_detail(".env.example ready", &term::short_path(&path));
     }
     if let Some(path) = agent_instructions {
-        println!("Created or updated {}", path.display());
+        term::ok_detail("AGENTS.md ready", &term::short_path(&path));
     }
     if cwd.join(".env").exists() {
-        println!("Warning: plaintext .env exists. Run ward import .env, then remove .env.");
+        term::warn("plaintext .env exists");
+        term::next("run: ward import .env");
     }
     if let Some(rc) = ensure_shell_integration() {
-        println!();
-        println!("Shell integration added to {}.", rc.display());
+        term::section("shell");
+        term::ok_detail("shell integration", &term::short_path(&rc));
         prompt_shell_reload(&rc);
     }
 
@@ -2013,8 +2019,14 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
 
-    println!("Created encrypted vault {}", written.display());
-    println!("Locked {}", source.display());
+    term::emit_header(&term::Header {
+        command: Some("import"),
+        project: &config.project,
+        path: Some(&cwd),
+        mode: None,
+    });
+    term::ok_detail("vault encrypted", &term::short_path(&written));
+    term::ok_detail("locked marker", &source.display().to_string());
     Ok(())
 }
 
@@ -2032,15 +2044,26 @@ fn register(project: String, path: Option<PathBuf>, explicit_vault: Option<PathB
     };
 
     let registered = registry::register_project(project.clone(), project_path, vault_path)?;
-    println!("Registered {project}");
-    println!("Path: {}", registered.path.display());
-    println!("Vault: {}", registered.vault.display());
+    term::emit_header(&term::Header {
+        command: Some("register"),
+        project: &project,
+        path: Some(&registered.path),
+        mode: None,
+    });
+    term::ok("project registered");
+    term::ok_detail("vault", &term::short_path(&registered.vault));
     Ok(())
 }
 
 fn use_project(project: &str) -> Result<()> {
     registry::set_active_project(project)?;
-    println!("Active Ward project: {project}");
+    term::emit_header(&term::Header {
+        command: Some("use"),
+        project,
+        path: None,
+        mode: None,
+    });
+    term::ok("active project selected");
     Ok(())
 }
 
@@ -2048,25 +2071,43 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
     match command {
         ProjectsCommand::List => {
             let registry = registry::list_projects()?;
+            term::emit_header(&term::Header {
+                command: Some("projects list"),
+                project: "registry",
+                path: None,
+                mode: None,
+            });
+            if registry.projects.is_empty() {
+                term::info("no registered projects");
+                return Ok(());
+            }
+            term::section("projects");
             for (name, project) in registry.projects {
                 let active = if registry.active_project.as_deref() == Some(name.as_str()) {
-                    "*"
+                    "active"
                 } else {
-                    " "
+                    "registered"
                 };
-                println!(
-                    "{active} {name} path={} vault={}",
-                    project.path.display(),
-                    project.vault.display()
+                term::ok_detail(
+                    &name,
+                    &format!(
+                        "{active} path={} vault={}",
+                        term::short_path(&project.path),
+                        term::short_path(&project.vault)
+                    ),
                 );
             }
         }
         ProjectsCommand::Show { project } => {
             let cwd = env::current_dir()?;
             let resolved = registry::resolve_project(project.as_deref(), &cwd)?;
-            println!("Project: {}", resolved.name);
-            println!("Path: {}", resolved.path.display());
-            println!("Vault: {}", resolved.vault.display());
+            term::emit_header(&term::Header {
+                command: Some("projects show"),
+                project: &resolved.name,
+                path: Some(&resolved.path),
+                mode: None,
+            });
+            term::ok_detail("vault", &term::short_path(&resolved.vault));
         }
         ProjectsCommand::Register {
             project,
@@ -2076,9 +2117,15 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
         ProjectsCommand::Use { project } => use_project(&project)?,
         ProjectsCommand::Remove { project } => {
             if registry::remove_project(&project)? {
-                println!("Removed project {project}");
+                term::emit_header(&term::Header {
+                    command: Some("projects remove"),
+                    project: &project,
+                    path: None,
+                    mode: None,
+                });
+                term::ok("project removed");
             } else {
-                println!("Project not found: {project}");
+                term::warn_detail("project not found", &project);
             }
         }
         ProjectsCommand::Provision {
@@ -2106,13 +2153,18 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
-                println!("Provisioned {}", status.project);
-                println!("Path: {}", status.path.display());
-                println!("Vault: {}", status.vault.display());
-                println!("Env: {}", status.env_names.join(", "));
-                println!("Profiles: {}", status.profiles.join(", "));
+                term::emit_header(&term::Header {
+                    command: Some("projects provision"),
+                    project: &status.project,
+                    path: Some(&status.path),
+                    mode: None,
+                });
+                term::ok("project provisioned");
+                term::ok_detail("vault", &term::short_path(&status.vault));
+                term::ok_detail("env", &status.env_names.join(", "));
+                term::ok_detail("profiles", &status.profiles.join(", "));
                 if !status.agents.is_empty() {
-                    println!("Agents: {}", status.agents.join(", "));
+                    term::ok_detail("agents", &status.agents.join(", "));
                 }
             }
         }
@@ -2151,21 +2203,18 @@ fn setup_command(command: SetupCommand) -> Result<()> {
                     &imported.path,
                     "Ward imported this cloud-managed project into a local encrypted vault.",
                 );
-                term::section("Cloud");
-                term::ok(&format!(
-                    "{} / {} / {}",
-                    imported.team, imported.project, imported.environment
-                ));
-                term::section("Vault");
-                term::ok(&format!(
-                    "encrypted vault written  {}",
-                    imported.vault.display()
-                ));
-                term::ok(&format!(
-                    "env names imported  {}",
-                    imported.env_names.join(", ")
-                ));
-                term::section("Project");
+                term::section("cloud");
+                term::ok_detail(
+                    "source",
+                    &format!(
+                        "{} / {} / {}",
+                        imported.team, imported.project, imported.environment
+                    ),
+                );
+                term::section("vault");
+                term::ok_detail("encrypted vault", &term::short_path(&imported.vault));
+                term::ok_detail("env names imported", &imported.env_names.join(", "));
+                term::section("project");
                 term::ok(".ward.json compiled from cloud policies");
                 term::ok("project registered");
             }
@@ -2208,10 +2257,10 @@ fn auth_command(command: AuthCommand) -> Result<()> {
                     Path::new("."),
                     "Ward created a local cloud account session and encrypted this device key with your PIN.",
                 );
-                term::section("Account");
-                term::ok(&format!("signed in as {}", session.account_email));
-                term::section("Device");
-                term::ok(&format!("registered {}", session.device_id));
+                term::section("account");
+                term::ok_detail("signed in", &session.account_email);
+                term::section("device");
+                term::ok_detail("registered", &session.device_id);
                 term::next("run: ward setup login");
             }
         }
@@ -2316,16 +2365,28 @@ fn publish_cloud_environment(
     if json {
         println!("{}", serde_json::to_string_pretty(&published)?);
     } else {
-        println!(
-            "Published {} / {} / {}",
-            published.team.name, published.project.name, published.environment.name
+        term::emit_header(&term::Header {
+            command: Some("cloud dev publish"),
+            project: &published.project.name,
+            path: Some(&source.path),
+            mode: None,
+        });
+        term::ok_detail(
+            "published",
+            &format!(
+                "{} / {} / {}",
+                published.team.name, published.project.name, published.environment.name
+            ),
         );
-        println!("Env: {}", published.environment.env_names.join(", "));
-        println!("Wrapped devices: {}", published.wrapped_devices);
+        term::ok_detail("env", &published.environment.env_names.join(", "));
+        term::ok_detail("wrapped devices", &published.wrapped_devices.to_string());
         if !published.rewrap_required_members.is_empty() {
-            println!(
-                "Rewrap required after device login: {}",
-                published.rewrap_required_members.join(", ")
+            term::warn_detail(
+                "rewrap required",
+                &format!(
+                    "after device login: {}",
+                    published.rewrap_required_members.join(", ")
+                ),
             );
         }
     }
@@ -2362,18 +2423,33 @@ fn store_command(command: StoreCommand) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&summaries)?);
             } else if summaries.is_empty() {
-                println!("No project-store snapshots.");
+                term::emit_header(&term::Header {
+                    command: Some("store list"),
+                    project: "local",
+                    path: None,
+                    mode: None,
+                });
+                term::info("no project-store snapshots");
             } else {
+                term::emit_header(&term::Header {
+                    command: Some("store list"),
+                    project: "local",
+                    path: None,
+                    mode: None,
+                });
+                term::section("snapshots");
                 for summary in summaries {
                     let stale = if summary.stale { " stale" } else { "" };
-                    println!(
-                        "{} env={} profiles={} agents={} updated={}{}",
-                        summary.project_name,
-                        summary.env_names.len(),
-                        summary.profile_names.len(),
-                        summary.agent_names.len(),
-                        summary.updated_at,
-                        stale
+                    term::ok_detail(
+                        &summary.project_name,
+                        &format!(
+                            "env={} profiles={} agents={} updated={}{}",
+                            summary.env_names.len(),
+                            summary.profile_names.len(),
+                            summary.agent_names.len(),
+                            summary.updated_at,
+                            stale
+                        ),
                     );
                 }
             }
@@ -2383,14 +2459,22 @@ fn store_command(command: StoreCommand) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
-                println!("Project: {}", summary.project_name);
-                println!("Path: {}", summary.path.display());
-                println!("Vault: {}", summary.vault.display());
-                println!("Env: {}", summary.env_names.join(", "));
-                println!("Profiles: {}", summary.profile_names.join(", "));
-                println!("Agents: {}", summary.agent_names.join(", "));
-                println!("Updated: {}", summary.updated_at);
-                println!("Stale: {}", summary.stale);
+                term::emit_header(&term::Header {
+                    command: Some("store show"),
+                    project: &summary.project_name,
+                    path: Some(&summary.path),
+                    mode: None,
+                });
+                term::ok_detail("vault", &term::short_path(&summary.vault));
+                term::ok_detail("env", &summary.env_names.join(", "));
+                term::ok_detail("profiles", &summary.profile_names.join(", "));
+                term::ok_detail("agents", &summary.agent_names.join(", "));
+                term::ok_detail("updated", &summary.updated_at);
+                if summary.stale {
+                    term::warn("snapshot stale");
+                } else {
+                    term::ok("snapshot fresh");
+                }
             }
         }
         StoreCommand::Refresh { project, json } => {
@@ -2401,10 +2485,13 @@ fn store_command(command: StoreCommand) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
-                println!(
-                    "Refreshed project-store snapshot for {} at {}",
-                    status.store.project_name, status.store.updated_at
-                );
+                term::emit_header(&term::Header {
+                    command: Some("store refresh"),
+                    project: &status.store.project_name,
+                    path: Some(&resolved.path),
+                    mode: None,
+                });
+                term::ok_detail("snapshot refreshed", &status.store.updated_at);
             }
         }
     }
@@ -2420,9 +2507,17 @@ fn config_command(command: ConfigCommand) -> Result<()> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&restored)?);
                     } else {
-                        println!("Restored .ward.json for {}", restored.project);
-                        println!("Config: {}", restored.config_path.display());
-                        println!("Backup: {}", restored.backup_path.display());
+                        term::emit_header(&term::Header {
+                            command: Some("config restore"),
+                            project: &restored.project,
+                            path: Some(&cwd),
+                            mode: None,
+                        });
+                        term::ok_detail(
+                            ".ward.json restored",
+                            &term::short_path(&restored.config_path),
+                        );
+                        term::ok_detail("backup", &term::short_path(&restored.backup_path));
                     }
                 }
                 None => {
@@ -2470,11 +2565,21 @@ fn workspace_command(command: WorkspaceCommand) -> Result<()> {
                     serde_json::to_string_pretty(&targets_as_json(&targets))?
                 );
             } else if targets.is_empty() {
-                term::warn("No configured Ward app projects found.");
+                term::warn("no configured Ward app projects found");
             } else {
+                term::emit_header(&term::Header {
+                    command: Some("workspace projects"),
+                    project: &discovery.workspace_name,
+                    path: Some(&discovery.root),
+                    mode: None,
+                });
+                term::section("apps");
                 for target in &targets {
                     let app = target.app_slug.as_deref().unwrap_or(&target.name);
-                    println!("{app}\t{}\t{}", target.name, target.path.display());
+                    term::ok_detail(
+                        app,
+                        &format!("{} path={}", target.name, term::short_path(&target.path)),
+                    );
                 }
             }
         }
@@ -2503,28 +2608,43 @@ fn targets_as_json(targets: &[workspace_target::WorkspaceTarget]) -> Vec<serde_j
 }
 
 fn print_workspace_discovery(discovery: &workspace::WorkspaceDiscovery) {
-    println!(
-        "Workspace: {} path={} manager={} turborepo={}",
-        discovery.workspace_name,
-        discovery.root.display(),
+    term::emit_header(&term::Header {
+        command: Some("workspace discover"),
+        project: &discovery.workspace_name,
+        path: Some(&discovery.root),
+        mode: None,
+    });
+    term::section("workspace");
+    term::ok_detail(
+        "package manager",
         discovery.package_manager.as_deref().unwrap_or("-"),
-        discovery.turborepo
     );
+    if discovery.turborepo {
+        term::ok("turborepo detected");
+    } else {
+        term::info("turborepo not detected");
+    }
+    term::section("packages");
     for package in &discovery.packages {
         let app_marker = if package.app_candidate {
             "app"
         } else {
             "package"
         };
-        println!(
-            "{app_marker:7} {} project={} env={:?} setup={:?} envNames={} path={}",
-            package.slug,
+        let detail = format!(
+            "kind={} project={} env={:?} setup={:?} envNames={} path={}",
+            app_marker,
             package.project_name,
             package.env_status,
             package.setup_status,
             package.env_example_keys.len(),
             package.relative_path.display()
         );
+        if package.app_candidate {
+            term::ok_detail(&package.slug, &detail);
+        } else {
+            term::info_detail(&package.slug, &detail);
+        }
     }
 }
 
@@ -2883,7 +3003,13 @@ fn broker_command(command: BrokerCommand) -> Result<()> {
         }
         BrokerCommand::Stop => {
             broker::stop()?;
-            println!("Ward broker stopped.");
+            term::emit_header(&term::Header {
+                command: Some("broker stop"),
+                project: "runtime",
+                path: None,
+                mode: None,
+            });
+            term::ok("broker stopped");
         }
         BrokerCommand::SocketPath => println!("{}", broker::socket_path().display()),
     }
@@ -2927,13 +3053,25 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
         }
         WorktreesCommand::AllowRoot { project, path } => {
             let root = worktrees::allow_root(&project, &path)?;
-            println!("Allowed worktree root for {project}: {}", root.display());
+            term::emit_header(&term::Header {
+                command: Some("worktrees allow-root"),
+                project: &project,
+                path: None,
+                mode: None,
+            });
+            term::ok_detail("allowed root", &term::short_path(&root));
         }
         WorktreesCommand::RemoveRoot { project, path } => {
             if worktrees::remove_root(&project, &path)? {
-                println!("Removed worktree root for {project}: {}", path.display());
+                term::emit_header(&term::Header {
+                    command: Some("worktrees remove-root"),
+                    project: &project,
+                    path: None,
+                    mode: None,
+                });
+                term::ok_detail("removed root", &term::short_path(&path));
             } else {
-                println!("Worktree root not found for {project}: {}", path.display());
+                term::warn_detail("worktree root not found", &term::short_path(&path));
             }
         }
         WorktreesCommand::Approve { request_id, json } => {
@@ -2950,7 +3088,13 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
                     );
                     return Ok(());
                 }
-                println!("Approved worktree {}", worktree.path.display());
+                term::emit_header(&term::Header {
+                    command: Some("worktrees approve"),
+                    project: "worktree binding",
+                    path: Some(&worktree.path),
+                    mode: None,
+                });
+                term::ok_detail("request approved", &request_id.to_string());
             } else {
                 if json {
                     println!(
@@ -2962,7 +3106,7 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
                     );
                     return Ok(());
                 }
-                println!("Worktree request not found: {request_id}");
+                term::warn_detail("worktree request not found", &request_id.to_string());
             }
         }
         WorktreesCommand::Deny { request_id, json } => {
@@ -2978,7 +3122,13 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
                     );
                     return Ok(());
                 }
-                println!("Denied worktree request {request_id}");
+                term::emit_header(&term::Header {
+                    command: Some("worktrees deny"),
+                    project: "worktree binding",
+                    path: None,
+                    mode: None,
+                });
+                term::ok_detail("request denied", &request_id.to_string());
             } else {
                 if json {
                     println!(
@@ -2990,7 +3140,7 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
                     );
                     return Ok(());
                 }
-                println!("Worktree request not found: {request_id}");
+                term::warn_detail("worktree request not found", &request_id.to_string());
             }
         }
     }
@@ -3169,7 +3319,13 @@ fn env_command(command: EnvCommand) -> Result<()> {
             })?;
             env_file::refresh_locked_env(&resolved.path, &resolved.vault)?;
             log_env_file_event("env.set", &resolved, None, Some(&key))?;
-            println!("Set encrypted env {key}");
+            term::emit_header(&term::Header {
+                command: Some("env set"),
+                project: &resolved.name,
+                path: Some(&resolved.path),
+                mode: None,
+            });
+            term::ok_detail("encrypted env set", &key);
         }
         EnvCommand::Unset { project, app, key } => {
             let passphrase = vault::read_existing_passphrase()?;
@@ -3185,9 +3341,15 @@ fn env_command(command: EnvCommand) -> Result<()> {
             env_file::refresh_locked_env(&resolved.path, &resolved.vault)?;
             log_env_file_event("env.unset", &resolved, None, Some(&key))?;
             if removed {
-                println!("Removed encrypted env {key}");
+                term::emit_header(&term::Header {
+                    command: Some("env unset"),
+                    project: &resolved.name,
+                    path: Some(&resolved.path),
+                    mode: None,
+                });
+                term::ok_detail("encrypted env removed", &key);
             } else {
-                println!("Encrypted env not found: {key}");
+                term::warn_detail("encrypted env not found", &key);
             }
         }
         EnvCommand::Unlock {
@@ -3209,9 +3371,15 @@ fn env_command(command: EnvCommand) -> Result<()> {
                     env_file::unlock_env_file(&output, &resolved.vault, &passphrase, force)
                 })?;
                 log_env_file_event("env.unlock", &resolved, Some(&output), None)?;
-                println!("Wrote plaintext env {}", output.display());
+                term::emit_header(&term::Header {
+                    command: Some("env unlock"),
+                    project: &resolved.name,
+                    path: Some(&resolved.path),
+                    mode: None,
+                });
+                term::warn_detail("plaintext env written", &term::short_path(&output));
             }
-            println!("Run ward env lock when you are done.");
+            term::next("run: ward env lock");
         }
         EnvCommand::Lock {
             project,
@@ -3230,7 +3398,14 @@ fn env_command(command: EnvCommand) -> Result<()> {
                 Ok(())
             })?;
             log_env_file_event("env.lock", &resolved, Some(&source), None)?;
-            println!("Re-encrypted vault and locked {}", source.display());
+            term::emit_header(&term::Header {
+                command: Some("env lock"),
+                project: &resolved.name,
+                path: Some(&resolved.path),
+                mode: None,
+            });
+            term::ok_detail("vault re-encrypted", &term::short_path(&resolved.vault));
+            term::ok_detail("locked marker", &term::short_path(&source));
         }
         EnvCommand::Export {
             project,
@@ -3259,7 +3434,13 @@ fn env_command(command: EnvCommand) -> Result<()> {
                     env_file::export_env_file(&output, &resolved.vault, &passphrase, force)
                 })?;
                 log_env_file_event("env.export", &resolved, Some(&output), None)?;
-                println!("Exported plaintext env {}", output.display());
+                term::emit_header(&term::Header {
+                    command: Some("env export"),
+                    project: &resolved.name,
+                    path: Some(&resolved.path),
+                    mode: None,
+                });
+                term::warn_detail("plaintext env exported", &term::short_path(&output));
             }
         }
     }
@@ -3398,9 +3579,15 @@ fn print_env_request_set_response(
             }))?
         );
     } else {
-        println!("{status}: {key} for {project}");
+        term::emit_header(&term::Header {
+            command: Some("env request-set"),
+            project,
+            path: None,
+            mode: None,
+        });
+        term::ok_detail(status, key);
         if let Some(command) = fix_command {
-            println!("Fix: {command}");
+            term::next(command);
         }
     }
     Ok(())
@@ -3463,7 +3650,7 @@ fn with_passphrase_vault_access<T>(
                 );
             }
             (Err(_), Err(error)) => {
-                eprintln!("Warning: Ward could not refresh the active broker session: {error}");
+                term::warn_detail("broker session refresh failed", &error.to_string());
             }
             _ => {}
         }
@@ -3492,7 +3679,7 @@ fn refresh_project_store_with_passphrase(
 
 fn warn_store_refresh_failure(result: Result<project_store::ProjectStoreSummary>) {
     if let Err(error) = result {
-        eprintln!("Ward warning: project-store snapshot refresh failed: {error}");
+        term::warn_detail("project-store refresh failed", &error.to_string());
     }
 }
 
@@ -3638,10 +3825,12 @@ fn wait_for_worktree_approval(
 ) -> Result<bool> {
     let timeout = unlock::parse_ttl(approval_timeout)?;
     let deadline = chrono::Utc::now() + timeout;
-    eprintln!(
-        "Ward is waiting for worktree approval {}. Open the dashboard notification center or run: ward worktrees approve {}",
-        request.id, request.id
-    );
+    term::emit_block(&term::MessageBlock {
+        level: term::StatusLevel::Info,
+        title: "waiting for worktree approval",
+        body: Some("open the dashboard notification center or approve from a human terminal"),
+        command: Some(&format!("ward worktrees approve {}", request.id)),
+    });
     loop {
         if worktrees::is_known_worktree(&resolved.name, &request.path)? {
             return Ok(true);
@@ -3804,9 +3993,22 @@ fn request_for_target(
     if json {
         println!("{}", serde_json::to_string_pretty(&approval_event)?);
     } else if decision.approved {
-        println!("Approved: {}", decision.approved_env.join(", "));
+        term::emit_header(&term::Header {
+            command: Some("request"),
+            project: &access.project,
+            path: Some(&resolved.path),
+            mode: None,
+        });
+        term::ok_detail("approved env", &decision.approved_env.join(", "));
+        term::ok_detail("scope", &format!("{:?}", decision.scope));
     } else {
-        println!("Denied");
+        term::emit_header(&term::Header {
+            command: Some("request"),
+            project: &access.project,
+            path: Some(&resolved.path),
+            mode: None,
+        });
+        term::warn("request denied");
     }
 
     Ok(())
@@ -3900,7 +4102,14 @@ fn allow_for_target(
         human_proof: approval_human_proof(decision.source),
     };
     audit_logs::append_event(LogKind::Approvals, approval_event)?;
-    println!("Created {} grant {}", scope, grant.id);
+    term::emit_header(&term::Header {
+        command: Some("allow"),
+        project: &access.project,
+        path: Some(&resolved.path),
+        mode: None,
+    });
+    term::ok_detail("grant created", &grant.id.to_string());
+    term::ok_detail("scope", &scope.to_string());
     Ok(())
 }
 
@@ -3920,11 +4129,12 @@ fn require_manual_allow_confirmation(scope: ApprovalScope) -> Result<()> {
                 "ward allow requires an interactive local terminal; agents must use ward run --wait-for-approval"
             );
         }
-        eprintln!("Ward allow creates a durable {scope} grant.");
-        eprintln!(
-            "Type `ALLOW {}` to continue:",
-            approval_scope_cli_value(scope)
-        );
+        term::emit_block(&term::MessageBlock {
+            level: term::StatusLevel::Warn,
+            title: "durable grant confirmation required",
+            body: Some("ward allow creates a reusable approval grant"),
+            command: Some(&format!("type: ALLOW {}", approval_scope_cli_value(scope))),
+        });
         let mut input = String::new();
         std::io::stdin()
             .read_line(&mut input)
@@ -3950,7 +4160,19 @@ fn approval_scope_cli_value(scope: ApprovalScope) -> &'static str {
 fn grants_command(command: GrantsCommand) -> Result<()> {
     match command {
         GrantsCommand::List => {
-            for grant in grants::load_grants()? {
+            term::emit_header(&term::Header {
+                command: Some("grants list"),
+                project: "local",
+                path: None,
+                mode: None,
+            });
+            let grants = grants::load_grants()?;
+            if grants.is_empty() {
+                term::info("no stored approval grants");
+                return Ok(());
+            }
+            term::section("grants");
+            for grant in grants {
                 let expires = match grant.expires_at {
                     Some(value) => value.to_rfc3339(),
                     None => "-".to_string(),
@@ -3962,31 +4184,45 @@ fn grants_command(command: GrantsCommand) -> Result<()> {
                     .as_ref()
                     .map(|receipt| receipt.payload_hash.as_str())
                     .unwrap_or("-");
-                println!(
-                    "{} scope={:?} status={} project={} command=\"{}\" env={} agent={} branch={} expires={} receipt={}",
-                    grant.id,
-                    grant.scope,
-                    status,
-                    grant.project,
-                    grant.command,
-                    grant.approved_env.join(","),
-                    grant.agent.as_deref().unwrap_or("-"),
-                    grant.branch.as_deref().unwrap_or("-"),
-                    expires,
-                    receipt_hash,
+                term::ok_detail(
+                    &grant.id.to_string(),
+                    &format!(
+                        "scope={:?} status={} project={} command=\"{}\" env={} agent={} branch={} expires={} receipt={}",
+                        grant.scope,
+                        status,
+                        grant.project,
+                        grant.command,
+                        grant.approved_env.join(","),
+                        grant.agent.as_deref().unwrap_or("-"),
+                        grant.branch.as_deref().unwrap_or("-"),
+                        expires,
+                        receipt_hash,
+                    ),
                 );
             }
         }
         GrantsCommand::Revoke { grant_id } => {
             if grants::revoke_grant(grant_id)? {
-                println!("Revoked grant {grant_id}");
+                term::emit_header(&term::Header {
+                    command: Some("grants revoke"),
+                    project: "local",
+                    path: None,
+                    mode: None,
+                });
+                term::ok_detail("grant revoked", &grant_id.to_string());
             } else {
-                println!("Grant not found: {grant_id}");
+                term::warn_detail("grant not found", &grant_id.to_string());
             }
         }
         GrantsCommand::Prune => {
             let pruned = grants::prune_expired_grants()?;
-            println!("Pruned {pruned} expired grant(s).");
+            term::emit_header(&term::Header {
+                command: Some("grants prune"),
+                project: "local",
+                path: None,
+                mode: None,
+            });
+            term::ok_detail("expired grants pruned", &pruned.to_string());
         }
     }
     Ok(())
@@ -3999,16 +4235,31 @@ fn approvals_command(command: ApprovalsCommand) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&notifications)?);
             } else if notifications.is_empty() {
-                println!("No pending Ward approval notifications.");
+                term::emit_header(&term::Header {
+                    command: Some("approvals list"),
+                    project: "local",
+                    path: None,
+                    mode: None,
+                });
+                term::info("no pending approval notifications");
             } else {
+                term::emit_header(&term::Header {
+                    command: Some("approvals list"),
+                    project: "local",
+                    path: None,
+                    mode: None,
+                });
+                term::section("pending");
                 for notification in notifications {
-                    println!(
-                        "{} {:?} project={} risk={} {}",
-                        notification.id,
-                        notification.kind,
-                        notification.project,
-                        notification.risk,
-                        notification.command.as_deref().unwrap_or("")
+                    term::warn_detail(
+                        &notification.id.to_string(),
+                        &format!(
+                            "{:?} project={} risk={} {}",
+                            notification.kind,
+                            notification.project,
+                            notification.risk,
+                            notification.command.as_deref().unwrap_or("")
+                        ),
                     );
                 }
             }
@@ -4030,10 +4281,13 @@ fn wait_for_approval_command(request_id: uuid::Uuid, json: bool, timeout: &str) 
             if json {
                 println!("{}", serde_json::to_string_pretty(&resolution)?);
             } else {
-                println!(
-                    "Request {} {} for project {}",
-                    resolution.request_id, resolution.status, resolution.project
-                );
+                term::emit_header(&term::Header {
+                    command: Some("approvals wait"),
+                    project: &resolution.project,
+                    path: None,
+                    mode: None,
+                });
+                term::ok_detail(&resolution.status, &resolution.request_id.to_string());
             }
             return Ok(());
         }
@@ -4045,7 +4299,7 @@ fn wait_for_approval_command(request_id: uuid::Uuid, json: bool, timeout: &str) 
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
-                println!("Timed out waiting for approval {request_id}");
+                term::warn_detail("approval wait timed out", &request_id.to_string());
             }
             return Ok(());
         }
@@ -4069,8 +4323,12 @@ fn require_human_terminal_confirmation(action: &str, request_id: uuid::Uuid) -> 
                 "Ward {action} requires an interactive local terminal; use the dashboard approval flow or ask a human to run this command"
         );
         }
-        eprintln!("Ward {action} requires local human confirmation.");
-        eprintln!("Type `{action} {request_id}` to continue:");
+        term::emit_block(&term::MessageBlock {
+            level: term::StatusLevel::Warn,
+            title: "human confirmation required",
+            body: Some("approval state can only be changed from an interactive local terminal"),
+            command: Some(&format!("type: {action} {request_id}")),
+        });
         let mut input = String::new();
         std::io::stdin()
             .read_line(&mut input)
@@ -4105,7 +4363,14 @@ fn approve(
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
-                println!("Approved request {request_id}: grant {}", response.grant_id);
+                term::emit_header(&term::Header {
+                    command: Some("approve"),
+                    project: &response.project,
+                    path: None,
+                    mode: None,
+                });
+                term::ok_detail("request approved", &request_id.to_string());
+                term::ok_detail("grant", &response.grant_id.to_string());
             }
             Ok(())
         }
@@ -4282,7 +4547,13 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
             }))?
         );
     } else {
-        println!("Denied request {request_id}");
+        term::emit_header(&term::Header {
+            command: Some("deny"),
+            project: &status.project,
+            path: None,
+            mode: None,
+        });
+        term::ok_detail("request denied", &request_id.to_string());
     }
     Ok(())
 }
@@ -5291,12 +5562,20 @@ fn logs(command: Option<LogsCommand>, kind: Option<LogKind>) -> Result<()> {
             } else {
                 audit_logs::verify_logs(kind)?
             };
+            term::emit_header(&term::Header {
+                command: Some("logs verify"),
+                project: "audit logs",
+                path: Some(&audit_logs::logs_dir()),
+                mode: None,
+            });
             for report in reports {
-                println!(
-                    "[ok] {} entries={} path={}",
+                term::ok_detail(
                     report.kind.as_str(),
-                    report.entries,
-                    report.path.display()
+                    &format!(
+                        "entries={} path={}",
+                        report.entries,
+                        term::short_path(&report.path)
+                    ),
                 );
             }
         }
@@ -5315,7 +5594,13 @@ fn logs(command: Option<LogsCommand>, kind: Option<LogKind>) -> Result<()> {
             warn_log_view_access();
             let output_contents = render_log_events(&audit_logs::decrypt_events(kind)?)?;
             crate::fs_util::write_private_file(&output, output_contents.as_bytes())?;
-            println!("Exported decrypted log {}", output.display());
+            term::emit_header(&term::Header {
+                command: Some("logs export"),
+                project: kind.as_str(),
+                path: Some(&output),
+                mode: None,
+            });
+            term::ok("decrypted log exported");
         }
         Some(LogsCommand::Unlock { ttl }) => unlock_logs(&ttl)?,
         None => match kind {
@@ -5357,7 +5642,16 @@ fn edit(project: Option<String>, app: Option<String>) -> Result<()> {
         vault: &resolved.vault,
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
-    println!("Updated encrypted vault.");
+    term::emit_header(&term::Header {
+        command: Some("edit"),
+        project: &resolved.name,
+        path: Some(&resolved.path),
+        mode: None,
+    });
+    term::ok_detail(
+        "encrypted vault updated",
+        &term::short_path(&resolved.vault),
+    );
     Ok(())
 }
 
@@ -5474,12 +5768,17 @@ fn unlock_vault_for_target(
                     let expires_at =
                         broker::active_session_expiry(&resolved.name, &resolved.vault)?
                             .context("broker session can serve env names but has no expiry")?;
-                    println!(
-                        "{} broker session active until {} ({} env names in memory).",
-                        resolved.name,
-                        expires_at.to_rfc3339(),
-                        names.len()
+                    term::emit_header(&term::Header {
+                        command: Some("unlock"),
+                        project: &resolved.name,
+                        path: Some(&resolved.path),
+                        mode: Some("verify"),
+                    });
+                    term::ok_detail(
+                        "broker session",
+                        &format!("expires {}", expires_at.to_rfc3339()),
                     );
+                    term::ok_detail("env names in memory", &names.len().to_string());
                 }
                 Err(_) => anyhow::bail!(
                     "broker has no active session for {}; run ward unlock --ttl 8h",
@@ -5501,20 +5800,21 @@ fn unlock_vault_for_target(
         )?;
         let session =
             create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, mode)?;
+        term::emit_header(&term::Header {
+            command: Some("unlock"),
+            project: &resolved.name,
+            path: Some(&resolved.path),
+            mode,
+        });
         if let Some(mode_name) = mode {
-            println!(
-                "{} vault unlocked with mode '{}' until {}.",
-                resolved.name,
-                mode_name,
-                session.expires_at.to_rfc3339()
-            );
+            term::ok_detail("vault unlocked", &format!("mode {mode_name}"));
         } else {
-            println!(
-                "{} vault unlocked until {}.",
-                resolved.name,
-                session.expires_at.to_rfc3339()
-            );
+            term::ok("vault unlocked");
         }
+        term::ok_detail(
+            "session active",
+            &format!("expires {}", session.expires_at.to_rfc3339()),
+        );
     }
     Ok(())
 }
@@ -5554,13 +5854,27 @@ fn lock(
 
         for target in targets {
             let status = broker::lock_project(&target.name, &target.vault)?;
-            println!(
-                "Locked {}: broker_session_removed={} revoked_session_grants={} cleared_unlock_sessions={} cancelled_human_commands={}",
-                status.project,
-                status.broker_session_removed,
-                status.revoked_session_grants,
-                status.cleared_unlock_sessions,
-                status.cancelled_human_commands,
+            term::emit_header(&term::Header {
+                command: Some("lock"),
+                project: &status.project,
+                path: Some(&target.path),
+                mode: None,
+            });
+            term::ok_detail(
+                "broker session removed",
+                &status.broker_session_removed.to_string(),
+            );
+            term::ok_detail(
+                "session grants revoked",
+                &status.revoked_session_grants.to_string(),
+            );
+            term::ok_detail(
+                "unlock metadata cleared",
+                &status.cleared_unlock_sessions.to_string(),
+            );
+            term::ok_detail(
+                "human commands cancelled",
+                &status.cancelled_human_commands.to_string(),
             );
         }
         return Ok(());
@@ -5579,8 +5893,14 @@ fn lock(
         cleared_unlock_sessions: cleared_unlocks,
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
-    println!("Revoked {revoked} session grant(s).");
-    println!("Cleared {cleared_unlocks} unlock session(s).");
+    term::emit_header(&term::Header {
+        command: Some("lock"),
+        project: "all projects",
+        path: None,
+        mode: None,
+    });
+    term::ok_detail("session grants revoked", &revoked.to_string());
+    term::ok_detail("unlock metadata cleared", &cleared_unlocks.to_string());
     Ok(())
 }
 
@@ -5642,8 +5962,14 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
         unlock::clear_project_unlocks(&project_name)?;
         let _ = unlock::create_run_unlock(&project_name, &new_vault, &passphrase, ttl);
     }
-    println!("[ok] Vault rotated to {}", new_vault.display());
-    println!("[ok] .ward.json updated with new nonce.");
+    term::emit_header(&term::Header {
+        command: Some("rotate"),
+        project: &project_name,
+        path: Some(&cwd),
+        mode: None,
+    });
+    term::ok_detail("vault rotated", &term::short_path(&new_vault));
+    term::ok(".ward.json updated with new nonce");
     Ok(())
 }
 
@@ -5698,9 +6024,16 @@ fn recovery_command(
             let out_path = recovery::export_recovery_file(&config.project, &passphrase, &dest)?;
             config.backup_exported = true;
             config::write_project_config(&cwd, &config, true)?;
-            println!("[ok] Recovery file exported to {}", out_path.display());
-            println!("  Store this file somewhere safe (USB drive, secure cloud backup).");
-            println!("  You will need it and your vault passphrase to restore access.");
+            term::emit_header(&term::Header {
+                command: Some("recovery export"),
+                project: &config.project,
+                path: Some(&cwd),
+                mode: None,
+            });
+            term::ok_detail("backup exported", &term::short_path(&out_path));
+            term::next(
+                "store this file somewhere safe, such as a USB drive or secure cloud backup",
+            );
         }
         RecoveryCommand::Import { path } => {
             let resolved_path = match path {
@@ -5708,7 +6041,13 @@ fn recovery_command(
                 None => prompt_drag_drop_path()?,
             };
             let dest = recovery::import_recovery_file(&resolved_path)?;
-            term::ok(&format!("Recovery file imported to {}", dest.display()));
+            term::emit_header(&term::Header {
+                command: Some("recovery import"),
+                project: "local recovery",
+                path: Some(&dest),
+                mode: None,
+            });
+            term::ok("recovery file imported");
         }
         RecoveryCommand::Create => {
             let cwd = env::current_dir()?;
@@ -5731,9 +6070,15 @@ fn recovery_command(
             )?;
             config.recovery_created = true;
             config::write_project_config(&cwd, &config, true)?;
-            println!("[ok] Recovery file created at {}", real_path.display());
-            println!("[ok] Decoy files generated to prevent fingerprinting.");
-            println!("  Run `ward recovery export` to save a backup to a safe location.");
+            term::emit_header(&term::Header {
+                command: Some("recovery create"),
+                project: &config.project,
+                path: Some(&cwd),
+                mode: None,
+            });
+            term::ok_detail("recovery key created", &term::short_path(&real_path));
+            term::ok("decoys generated");
+            term::next("run: ward recovery export");
         }
         RecoveryCommand::Restore { path } => {
             let cwd = env::current_dir()?;
@@ -5755,10 +6100,13 @@ fn recovery_command(
                     &recovery_file,
                     &passphrase,
                 )?;
-                println!(
-                    "[ok] Recovery file imported from {}",
-                    recovery_file.display()
-                );
+                term::emit_header(&term::Header {
+                    command: Some("recovery restore"),
+                    project: &config.project,
+                    path: Some(&cwd),
+                    mode: None,
+                });
+                term::ok_detail("recovery file imported", &term::short_path(&recovery_file));
             } else {
                 recovery::restore_vault_from_recovery(
                     &config.project,
@@ -5766,14 +6114,20 @@ fn recovery_command(
                     Some(&passphrase),
                     &passphrase,
                 )?;
+                term::emit_header(&term::Header {
+                    command: Some("recovery restore"),
+                    project: &config.project,
+                    path: Some(&cwd),
+                    mode: None,
+                });
             }
 
             config.recovery_created = true;
             config::write_project_config(&cwd, &config, true)?;
             env_file::refresh_locked_env(&cwd, &vault_path)?;
-            registry::update_project_vault(&config.project, cwd, vault_path.clone())?;
-            println!("[ok] Vault restored to {}", vault_path.display());
-            println!("  Run `ward unlock --ttl 8h` to start a fresh broker session.");
+            registry::update_project_vault(&config.project, cwd.clone(), vault_path.clone())?;
+            term::ok_detail("vault restored", &term::short_path(&vault_path));
+            term::next("run: ward unlock --ttl 8h");
         }
     }
     Ok(())
@@ -6333,17 +6687,21 @@ fn modes_command(command: ModesCommand) -> Result<()> {
             )?;
             let resolved = target.resolved_project();
             let modes = modes::load_local_modes(&resolved.path)?;
+            term::emit_header(&term::Header {
+                command: Some("modes list"),
+                project: &resolved.name,
+                path: Some(&resolved.path),
+                mode: None,
+            });
             if modes.is_empty() {
-                println!("No modes defined in .ward.modes.json");
+                term::info("no modes defined in .ward.modes.json");
             } else {
                 for mode in &modes {
-                    println!(
-                        "{} ({})",
-                        mode.name,
-                        serde_json::to_string(&mode.level)
-                            .unwrap_or_default()
-                            .trim_matches('"')
-                    );
+                    let level = serde_json::to_string(&mode.level)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    term::ok_detail(&mode.name, &level);
                 }
             }
             Ok(())
@@ -6371,11 +6729,13 @@ fn modes_command(command: ModesCommand) -> Result<()> {
                     .context("invalid passphrase — cannot push modes")
             })?;
             modes::push_modes(&local_modes, &resolved.name, &passphrase, &modes_path)?;
-            println!(
-                "Pushed {} mode(s) for project '{}'.",
-                local_modes.len(),
-                resolved.name
-            );
+            term::emit_header(&term::Header {
+                command: Some("modes push"),
+                project: &resolved.name,
+                path: Some(&resolved.path),
+                mode: None,
+            });
+            term::ok_detail("modes pushed", &format!("{} mode(s)", local_modes.len()));
             Ok(())
         }
         ModesCommand::Status { project, app } => {
@@ -6385,15 +6745,21 @@ fn modes_command(command: ModesCommand) -> Result<()> {
                 &cwd,
             )?;
             let resolved = target.resolved_project();
+            term::emit_header(&term::Header {
+                command: Some("modes status"),
+                project: &resolved.name,
+                path: Some(&resolved.path),
+                mode: None,
+            });
             match broker::status() {
                 Ok(status) => {
                     let session = status.sessions.iter().find(|s| s.project == resolved.name);
                     match session.and_then(|s| s.active_mode.as_deref()) {
-                        Some(mode_name) => println!("Active mode: {mode_name}"),
-                        None => println!("No active mode for project '{}'.", resolved.name),
+                        Some(mode_name) => term::ok_detail("active mode", mode_name),
+                        None => term::info("no active mode"),
                     }
                 }
-                Err(_) => println!("Broker not running — no active mode."),
+                Err(_) => term::warn("broker not running; no active mode"),
             }
             Ok(())
         }
@@ -6435,9 +6801,15 @@ fn teardown(
             decrypt_key: passphrase,
         },
     )?;
-    println!("Exported plaintext env {}", outcome.export_path.display());
-    println!("Removed Ward project {}", outcome.project);
-    println!("Encrypted audit logs were preserved.");
+    term::emit_header(&term::Header {
+        command: Some("teardown"),
+        project: &outcome.project,
+        path: Some(&resolved.path),
+        mode: None,
+    });
+    term::ok_detail("plaintext export", &term::short_path(&outcome.export_path));
+    term::ok("Ward project removed");
+    term::ok("encrypted audit logs preserved");
     Ok(())
 }
 
@@ -6455,10 +6827,15 @@ fn unlock_logs(ttl: &str) -> Result<()> {
         expires_at: "deprecated-validate-only".to_string(),
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
-    println!(
-        "Log passphrase validated. Note: ward logs unlock is deprecated; logs view/export prompts every time."
-    );
-    println!("Requested TTL {ttl} was ignored.");
+    term::emit_header(&term::Header {
+        command: Some("logs unlock"),
+        project: &resolved.name,
+        path: Some(&resolved.path),
+        mode: None,
+    });
+    term::warn("logs unlock is deprecated");
+    term::info("logs view/export validates the passphrase every time");
+    term::info_detail("requested TTL ignored", ttl);
     Ok(())
 }
 
@@ -6473,9 +6850,14 @@ fn ensure_logs_passphrase() -> Result<()> {
 }
 
 fn warn_log_view_access() {
-    eprintln!(
-        "Ward warning: decrypted logs are for review only. Edits are tamper-evident through the hash chain; deleted logs should be treated as a high-severity signal."
-    );
+    term::emit_block(&term::MessageBlock {
+        level: term::StatusLevel::Warn,
+        title: "decrypted logs are for review only",
+        body: Some(
+            "edits are tamper-evident through the hash chain; deleted logs should be treated as high severity",
+        ),
+        command: None,
+    });
 }
 
 fn resolve_profile(
@@ -6692,7 +7074,7 @@ fn critical_confirmation_for_decision(
 
 fn handle_post_run_logging_result(exit_code: i32, result: Result<()>) -> Result<()> {
     if let Err(error) = result {
-        eprintln!("Ward warning: post-run audit logging failed: {error}");
+        term::warn_detail("post-run audit logging failed", &error.to_string());
         if exit_code == 0 {
             anyhow::bail!("Ward post-run audit logging failed");
         }
@@ -6702,7 +7084,7 @@ fn handle_post_run_logging_result(exit_code: i32, result: Result<()>) -> Result<
 
 fn warn_anomaly_failure(result: Result<()>) {
     if let Err(error) = result {
-        eprintln!("Ward warning: anomaly detection failed: {error}");
+        term::warn_detail("anomaly detection failed", &error.to_string());
     }
 }
 
@@ -6919,10 +7301,12 @@ fn wait_for_run_approval(
 ) -> Result<Option<ApprovalDecision>> {
     let timeout = unlock::parse_ttl(approval_timeout)?;
     let deadline = chrono::Utc::now() + timeout;
-    eprintln!(
-        "Ward is waiting for approval {}. Open the dashboard notification center, or ask a human to run: ward approve {} --scope session",
-        pending.id, pending.id
-    );
+    term::emit_block(&term::MessageBlock {
+        level: term::StatusLevel::Info,
+        title: "waiting for approval",
+        body: Some("open the dashboard notification center or approve from a human terminal"),
+        command: Some(&format!("ward approve {} --scope session", pending.id)),
+    });
 
     loop {
         if let Some(resolution) = pending_requests::load_resolution(pending.id)? {
@@ -7025,9 +7409,12 @@ fn execute_no_prompt_with_optional_wait(
                         Some("ward unlock --ttl 8h"),
                     )?;
                     unlock_notification = Some(notification.id);
-                    eprintln!(
-                        "Ward is waiting for unlock before running this command. Run: ward unlock --ttl 8h"
-                    );
+                    term::emit_block(&term::MessageBlock {
+                        level: term::StatusLevel::Warn,
+                        title: "waiting for unlock",
+                        body: Some("the command will resume after the broker session is active"),
+                        command: Some("ward unlock --ttl 8h"),
+                    });
                 }
 
                 if chrono::Utc::now() >= deadline {

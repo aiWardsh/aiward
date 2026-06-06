@@ -29,7 +29,7 @@ use crate::{
     logs::{self, LogKind},
     notifications, project_store, project_teardown,
     registry::{self, RegisteredProject},
-    teams, workspace, worktrees,
+    teams, term, workspace, worktrees,
 };
 
 const DEFAULT_PORT: u16 = 7777;
@@ -359,12 +359,30 @@ pub fn stop_dashboards(options: DashboardStopOptions) -> Result<()> {
     if options.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else if result.stopped.is_empty() {
-        println!("No standalone Ward dashboard instances were running.");
+        term::emit_header(&term::Header {
+            command: Some("dashboard stop"),
+            project: "local",
+            path: None,
+            mode: None,
+        });
+        term::info("no standalone dashboard instances were running");
+        if result.stale_removed > 0 {
+            term::ok_detail("stale metadata removed", &result.stale_removed.to_string());
+        }
     } else {
-        println!(
-            "Stopped {} standalone Ward dashboard instance(s).",
-            result.stopped.len()
+        term::emit_header(&term::Header {
+            command: Some("dashboard stop"),
+            project: "local",
+            path: None,
+            mode: None,
+        });
+        term::ok_detail(
+            "dashboard stopped",
+            &format!("{} instance(s)", result.stopped.len()),
         );
+        if result.stale_removed > 0 {
+            term::ok_detail("stale metadata removed", &result.stale_removed.to_string());
+        }
     }
     Ok(())
 }
@@ -377,16 +395,26 @@ pub fn print_dashboard_status(json_output: bool) -> Result<()> {
         return Ok(());
     }
 
+    term::emit_header(&term::Header {
+        command: Some("dashboard status"),
+        project: "local",
+        path: None,
+        mode: None,
+    });
     if status.instances.is_empty() {
-        println!("No standalone Ward dashboards are running.");
+        term::info("no standalone browser dashboards running");
+        term::next("run: ward dashboard start");
     } else {
+        term::section("instances");
         for instance in &status.instances {
-            println!(
-                "pid={} port={} project={} url={}",
-                instance.pid,
-                instance.port,
-                instance.started_project.as_deref().unwrap_or("-"),
-                instance.url
+            term::ok_detail(
+                &format!("pid {}", instance.pid),
+                &format!(
+                    "port={} project={} url={}",
+                    instance.port,
+                    instance.started_project.as_deref().unwrap_or("-"),
+                    instance.url
+                ),
             );
         }
     }
@@ -2112,9 +2140,34 @@ fn print_start_result(result: &DashboardStartResult, json_output: bool) -> Resul
     if json_output {
         println!("{}", serde_json::to_string_pretty(result)?);
     } else if result.reused {
-        println!("Ward dashboard already running: {}", result.instance.url);
+        term::emit_header(&term::Header {
+            command: Some("dashboard start"),
+            project: result
+                .instance
+                .started_project
+                .as_deref()
+                .unwrap_or("local"),
+            path: Some(&result.instance.started_path),
+            mode: Some("reused"),
+        });
+        term::ok_detail(
+            "dashboard already running",
+            &format!("pid {}", result.instance.pid),
+        );
+        term::ok_detail("url", &result.instance.url);
     } else {
-        println!("Ward dashboard running: {}", result.instance.url);
+        term::emit_header(&term::Header {
+            command: Some("dashboard start"),
+            project: result
+                .instance
+                .started_project
+                .as_deref()
+                .unwrap_or("local"),
+            path: Some(&result.instance.started_path),
+            mode: None,
+        });
+        term::ok_detail("dashboard running", &format!("pid {}", result.instance.pid));
+        term::ok_detail("url", &result.instance.url);
     }
     Ok(())
 }

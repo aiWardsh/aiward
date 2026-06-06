@@ -16,7 +16,8 @@ use base64::Engine as _;
 
 const HUMAN_ACTIVATION_BODY: &str =
     "Enter your vault passphrase to activate human mode for this terminal.";
-const HUMAN_ACTIVE_BODY: &str = "This terminal is now protected. Normal commands in this Ward project will receive vault envs through Ward while this session is active.";
+const HUMAN_ACTIVE_BODY: &str =
+    "This terminal is now protected. Normal project commands receive vault envs through Ward while this session is active.";
 
 // ── Path helpers ─────────────────────────────────────────────────────────────
 
@@ -293,13 +294,12 @@ pub fn activate_human_mode(
             ttl,
             None,
         ) {
-            term::section("Session");
-            term::warn("human mode was not activated");
-            term::info(&format!(
-                "The vault passphrase did not unlock {}.",
-                resolved.name
-            ));
-            term::next("try again with: ward human");
+            term::emit_block(&term::MessageBlock {
+                level: term::StatusLevel::Warn,
+                title: "human mode not activated",
+                body: Some("the vault passphrase did not unlock this project"),
+                command: Some("ward human"),
+            });
             return Err(error).context("human mode was not activated");
         }
     }
@@ -352,10 +352,12 @@ pub fn activate_human_mode(
     let deadline = Instant::now() + Duration::from_secs(3);
     while !ready.exists() {
         if Instant::now() >= deadline {
-            term::section("Session");
-            term::warn("human mode was not activated");
-            term::info("The terminal guardian did not become ready in time.");
-            term::next("try again with: ward human");
+            term::emit_block(&term::MessageBlock {
+                level: term::StatusLevel::Warn,
+                title: "human mode not activated",
+                body: Some("the terminal guardian did not become ready in time"),
+                command: Some("ward human"),
+            });
             anyhow::bail!("human guardian did not become ready in time");
         }
         thread::sleep(Duration::from_millis(25));
@@ -364,22 +366,21 @@ pub fn activate_human_mode(
     let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
     let ttl_label = format_ttl_label(ttl_seconds);
 
-    term::info(HUMAN_ACTIVE_BODY);
-    term::blank();
-    term::section("Session");
+    term::section("session");
     term::ok("human mode active");
+    term::info(HUMAN_ACTIVE_BODY);
     if targets.len() > 1 {
-        term::ok(&format!(
-            "{} workspace app sessions unlocked",
-            targets.len()
-        ));
+        term::ok_detail(
+            "workspace apps unlocked",
+            &format!("{} project sessions", targets.len()),
+        );
     }
-    term::ok(&format!("expires in {ttl_label}"));
-    term::ok(&format!("guardian attached to shell {shell_pid}"));
+    term::ok_detail("expires", &ttl_label);
+    term::ok_detail("guardian attached", &format!("shell {shell_pid}"));
 
-    term::section("Commands");
+    term::section("commands");
     if shell_hooks_loaded {
-        term::ok("wrapped project commands route through ward run");
+        term::ok_detail("commands wrapped", "route through ward run");
         term::next("try: pnpm dev");
     } else {
         print_missing_shell_hooks_warning();
@@ -387,7 +388,7 @@ pub fn activate_human_mode(
 
     if let Ok(instances) = crate::webui::dashboard_diagnostics() {
         if let Some(instance) = instances.first() {
-            term::section("Dashboard");
+            term::section("dashboard");
             term::next(&format!("open: {}", instance.url));
         }
     }
