@@ -49,5 +49,5 @@ This CLA is based on the Apache Individual Contributor License Agreement.
 ## Security Issues
 
 Do not open public issues for security vulnerabilities. Email
-`security@aiward.dev` (or contact via GitHub private vulnerability reporting)
+`eduardonicoleit@aiward.dev` (or contact via GitHub private vulnerability reporting)
 so it can be addressed before public disclosure.
