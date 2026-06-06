@@ -602,22 +602,23 @@ fn sign_grant(
 
     #[cfg(not(any(test, coverage)))]
     {
-        let broker_payload = approval_receipts::build_payload_with_context(
-            access,
-            grant.id,
-            context.request_id,
-            &grant.approved_env,
-            grant.scope,
-            grant.expires_at,
-            context.critical_confirmation,
-            grant.created_at,
-            String::new(),
-            context.verified_context.as_ref(),
-        );
+        let broker_payload =
+            approval_receipts::build_payload(approval_receipts::PayloadBuildRequest {
+                access,
+                grant_id: grant.id,
+                request_id: context.request_id,
+                approved_env: &grant.approved_env,
+                scope: grant.scope,
+                expires_at: grant.expires_at,
+                critical_confirmation: context.critical_confirmation,
+                created_at: grant.created_at,
+                signer_key_id: String::new(),
+                verified_context: context.verified_context.as_ref(),
+            });
         let receipt = broker::sign_receipt(&access.project, vault, broker_payload)
             .map_err(|error| anyhow::anyhow!("signing_key_unavailable: {error}"))?;
         grant.receipt = Some(receipt);
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(any(test, coverage))]
@@ -631,18 +632,18 @@ fn sign_grant(
                 anyhow::bail!("{reason}")
             }
         };
-        let payload = approval_receipts::build_payload_with_context(
+        let payload = approval_receipts::build_payload(approval_receipts::PayloadBuildRequest {
             access,
-            grant.id,
-            context.request_id,
-            &grant.approved_env,
-            grant.scope,
-            grant.expires_at,
-            context.critical_confirmation,
-            grant.created_at,
-            signing_key.signer_key_id.clone(),
-            context.verified_context.as_ref(),
-        );
+            grant_id: grant.id,
+            request_id: context.request_id,
+            approved_env: &grant.approved_env,
+            scope: grant.scope,
+            expires_at: grant.expires_at,
+            critical_confirmation: context.critical_confirmation,
+            created_at: grant.created_at,
+            signer_key_id: signing_key.signer_key_id.clone(),
+            verified_context: context.verified_context.as_ref(),
+        });
         let receipt = approval_receipts::sign_payload(payload, &signing_key)
             .expect("grant payload signer id is built from the active signing key");
         grant.receipt = Some(receipt);
@@ -669,7 +670,7 @@ fn receipt_matches_grant(grant: &ApprovalGrant) -> bool {
         && payload
             .agent_key_id
             .as_ref()
-            .map_or(true, |value| !value.is_empty())
+            .is_none_or(|value| !value.is_empty())
         && approval_receipts::verify_receipt_signature(&grant.project, receipt)
 }
 

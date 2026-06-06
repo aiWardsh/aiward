@@ -354,4 +354,6 @@ Ward doctor will warn you if the recovery key is missing or if no backup has bee
 
 ## License
 
-MIT OR Apache-2.0 — free to use, modify, and distribute.
+AGPL-3.0-only. Ward is free to use, modify, and distribute. If you run a
+modified version as a network service, you must make the corresponding source
+available under the GNU Affero General Public License v3.

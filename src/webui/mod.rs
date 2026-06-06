@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     io::Cursor,
     net::TcpStream,
@@ -23,15 +23,14 @@ use std::os::unix::process::CommandExt;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::{
-    approvals, broker,
+    approvals, audit, broker,
     config::{self, ProfileConfig},
-    fs_util, human,
-    logs::{self, LogKind},
-    notifications,
-    project_store,
+    fs_util, human, logs, notifications, process_util, project_store,
     registry::{self, RegisteredProject},
     workspace, worktrees,
 };
+
+mod assets;
 
 const DEFAULT_PORT: u16 = 7777;
 const PORT_SCAN_WIDTH: u16 = 20;
@@ -386,22 +385,22 @@ fn handle(mut req: tiny_http::Request, token: &str) {
     }
 
     if method == Method::Get && path == "/favicon.png" {
-        serve_png(req, WARD_FAVICON_LIGHT_PNG);
+        serve_png(req, assets::WARD_FAVICON_LIGHT_PNG);
         return;
     }
 
     if method == Method::Get && path == "/favicon.svg" {
-        serve_svg(req, WARD_LOGO_DARK_SVG);
+        serve_svg(req, assets::WARD_LOGO_DARK_SVG);
         return;
     }
 
     if method == Method::Get && path == "/assets/ward-logo-dark.png" {
-        serve_png(req, WARD_LOGO_DARK_PNG);
+        serve_png(req, assets::WARD_LOGO_DARK_PNG);
         return;
     }
 
     if method == Method::Get && path == "/assets/ward-logo-transparent.svg" {
-        serve_svg(req, WARD_LOGO_TRANSPARENT_SVG);
+        serve_svg(req, assets::WARD_LOGO_TRANSPARENT_SVG);
         return;
     }
 
@@ -417,7 +416,7 @@ fn handle(mut req: tiny_http::Request, token: &str) {
         }
         (Method::Get, "/api/events") => {
             let project = query_param(&query, "project");
-            respond_json_result(req, Ok(load_all_events(project.as_deref())))
+            respond_json_result(req, Ok(audit::load_dashboard_events(project.as_deref())))
         }
         (Method::Get, "/api/notifications") => {
             respond_json_result(req, notifications::list_notifications())
@@ -482,7 +481,7 @@ fn handle(mut req: tiny_http::Request, token: &str) {
 }
 
 fn serve_html(req: tiny_http::Request) {
-    let html = DASHBOARD_HTML.as_bytes();
+    let html = assets::DASHBOARD_HTML.as_bytes();
     let response = Response::new(
         StatusCode(200),
         vec![
@@ -1470,125 +1469,6 @@ fn collect_profile_env(profile: &ProfileConfig, names: &mut BTreeSet<String>) {
     names.extend(profile.env.iter().cloned());
 }
 
-fn load_all_events(project_filter: Option<&str>) -> Vec<Value> {
-    let registry = registry::list_projects().unwrap_or_default();
-    let mut all = Vec::new();
-    for &kind in LogKind::all() {
-        if let Ok(events) = logs::decrypt_events(kind) {
-            for mut event in events {
-                scrub_sensitive_fields(&mut event);
-                let project = infer_event_project(&event, &registry.projects);
-                if let Some(filter) = project_filter {
-                    if project.as_deref() != Some(filter) {
-                        continue;
-                    }
-                }
-                if let Some(obj) = event.as_object_mut() {
-                    obj.insert(
-                        "_kind".to_string(),
-                        Value::String(event_kind_str(kind).to_string()),
-                    );
-                    if let Some(project) = project {
-                        obj.insert("_project".to_string(), Value::String(project));
-                    }
-                }
-                all.push(event);
-            }
-        }
-    }
-    all.sort_by(|a, b| {
-        let ta = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        let tb = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        tb.cmp(ta)
-    });
-    all
-}
-
-fn event_kind_str(kind: LogKind) -> &'static str {
-    match kind {
-        LogKind::Executions => "execution",
-        LogKind::Requests => "request",
-        LogKind::Approvals => "approval",
-        LogKind::Alerts => "alert",
-        LogKind::Sessions => "session",
-    }
-}
-
-fn infer_event_project(
-    event: &Value,
-    projects: &BTreeMap<String, RegisteredProject>,
-) -> Option<String> {
-    let payload = event.get("payload").unwrap_or(event);
-    for path in [
-        vec!["project"],
-        vec!["access", "project"],
-        vec!["verifiedContext", "project"],
-        vec!["payload", "project"],
-    ] {
-        if let Some(project) = nested_str(payload, &path) {
-            return Some(project.to_string());
-        }
-    }
-
-    for path in [
-        vec!["cwd"],
-        vec!["worktree"],
-        vec!["git", "worktreePath"],
-        vec!["access", "worktree"],
-    ] {
-        if let Some(candidate) = nested_str(payload, &path) {
-            if let Some(project) = project_for_path(candidate, projects) {
-                return Some(project);
-            }
-        }
-    }
-    None
-}
-
-fn nested_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
-    path.iter()
-        .try_fold(value, |current, key| current.get(*key))
-        .and_then(Value::as_str)
-}
-
-fn project_for_path(path: &str, projects: &BTreeMap<String, RegisteredProject>) -> Option<String> {
-    let candidate = Path::new(path);
-    projects
-        .iter()
-        .filter(|(_, project)| candidate.starts_with(&project.path))
-        .max_by_key(|(_, project)| project.path.components().count())
-        .map(|(name, _)| name.clone())
-}
-
-fn scrub_sensitive_fields(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, nested) in map.iter_mut() {
-                if should_redact_key(key) {
-                    *nested = Value::String("[redacted]".to_string());
-                } else {
-                    scrub_sensitive_fields(nested);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                scrub_sensitive_fields(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn should_redact_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    lower.contains("passphrase")
-        || lower.contains("sessiontoken")
-        || lower == "token"
-        || lower.contains("plaintext")
-        || lower == "secret"
-}
-
 fn current_instance(port: u16, token: String) -> Result<DashboardInstance> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let started_project = registry::resolve_project(None, &cwd)
@@ -1698,7 +1578,7 @@ fn running_instances() -> Result<Vec<DashboardInstance>> {
     Ok(load_instances()?
         .into_iter()
         .filter(|instance| {
-            human::process_exists(instance.pid) && is_dashboard_process(instance.pid)
+            process_util::process_exists(instance.pid) && is_dashboard_process(instance.pid)
         })
         .collect())
 }
@@ -1735,7 +1615,7 @@ fn cleanup_stale_instances() -> Result<usize> {
             removed += 1;
             continue;
         }
-        if !human::process_exists(instance.pid) || !is_dashboard_process(instance.pid) {
+        if !process_util::process_exists(instance.pid) || !is_dashboard_process(instance.pid) {
             let _ = remove_instance(instance.pid);
             removed += 1;
         }
@@ -1785,31 +1665,11 @@ fn open_browser_best_effort(url: &str) {
 }
 
 fn terminate_dashboard_process(pid: u32) {
-    #[cfg(unix)]
-    {
-        if !is_dashboard_process(pid) {
-            return;
-        }
-        // SAFETY: target pid is selected by dashboard command-line inspection.
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            if !human::process_exists(pid) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        // SAFETY: best-effort stop for the same dashboard process if SIGTERM was ignored.
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
+    process_util::terminate_if_matches(pid, Duration::from_secs(1), is_dashboard_process);
 }
 
 fn is_dashboard_process(pid: u32) -> bool {
-    command_line(pid)
+    process_util::command_line(pid)
         .map(|line| {
             line.contains("__dashboard-server")
                 || (line.contains("dashboard")
@@ -1818,31 +1678,6 @@ fn is_dashboard_process(pid: u32) -> bool {
         })
         .unwrap_or(false)
 }
-
-fn command_line(pid: u32) -> Option<String> {
-    #[cfg(unix)]
-    {
-        let output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
-const WARD_LOGO_DARK_SVG: &str = include_str!("../assets/ward-logo-dark.svg");
-const WARD_LOGO_TRANSPARENT_SVG: &str = include_str!("../assets/ward-logo-transparent.svg");
-const WARD_LOGO_DARK_PNG: &[u8] = include_bytes!("../assets/ward-logo-dark.png");
-const WARD_FAVICON_LIGHT_PNG: &[u8] = include_bytes!("../assets/ward-favicon-light.png");
 
 #[allow(dead_code)]
 const LEGACY_OVERVIEW_HTML: &str = r##"<!doctype html>
@@ -2228,6 +2063,7 @@ load().catch(error => {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logs::LogKind;
     use serial_test::serial;
 
     struct WardHomeGuard {
@@ -2273,7 +2109,7 @@ mod tests {
                 "nested": { "passphrase": "secret" }
             }
         });
-        scrub_sensitive_fields(&mut event);
+        audit::scrub_sensitive_fields(&mut event);
         assert_eq!(event["payload"]["sessionToken"], "[redacted]");
         assert_eq!(event["payload"]["nested"]["passphrase"], "[redacted]");
         assert_eq!(event["payload"]["requestedEnv"][0], "PAYLOAD_SECRET");
@@ -2322,25 +2158,25 @@ mod tests {
 
     #[test]
     fn dashboard_html_restores_old_logs_shell() {
-        assert!(DASHBOARD_HTML.contains("table-pane"));
-        assert!(DASHBOARD_HTML.contains("detail-pane"));
-        assert!(DASHBOARD_HTML.contains("data-kind=\"execution\""));
-        assert!(DASHBOARD_HTML.contains("profile policies"));
-        assert!(DASHBOARD_HTML.contains("dropdown-button"));
-        assert!(DASHBOARD_HTML.contains("splitter"));
-        assert!(DASHBOARD_HTML.contains("openProjectLogs"));
-        assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
-        assert!(DASHBOARD_HTML.contains("notifications-btn"));
-        assert!(DASHBOARD_HTML.contains("/api/notifications/stream"));
-        assert!(DASHBOARD_HTML.contains("/api/approvals/"));
-        assert!(DASHBOARD_HTML.contains("/api/worktrees/"));
-        assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.png\""));
-        assert!(DASHBOARD_HTML.contains("/assets/ward-logo-dark.png"));
-        assert!(WARD_LOGO_DARK_SVG.contains("<rect"));
-        assert!(WARD_LOGO_TRANSPARENT_SVG.contains("<svg"));
-        assert!(WARD_LOGO_DARK_PNG.starts_with(b"\x89PNG"));
-        assert!(WARD_FAVICON_LIGHT_PNG.starts_with(b"\x89PNG"));
-        assert!(!DASHBOARD_HTML.contains("<select"));
+        assert!(assets::DASHBOARD_HTML.contains("table-pane"));
+        assert!(assets::DASHBOARD_HTML.contains("detail-pane"));
+        assert!(assets::DASHBOARD_HTML.contains("data-kind=\"execution\""));
+        assert!(assets::DASHBOARD_HTML.contains("profile policies"));
+        assert!(assets::DASHBOARD_HTML.contains("dropdown-button"));
+        assert!(assets::DASHBOARD_HTML.contains("splitter"));
+        assert!(assets::DASHBOARD_HTML.contains("openProjectLogs"));
+        assert!(assets::DASHBOARD_HTML.contains("tablePaneWidth"));
+        assert!(assets::DASHBOARD_HTML.contains("notifications-btn"));
+        assert!(assets::DASHBOARD_HTML.contains("/api/notifications/stream"));
+        assert!(assets::DASHBOARD_HTML.contains("/api/approvals/"));
+        assert!(assets::DASHBOARD_HTML.contains("/api/worktrees/"));
+        assert!(assets::DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.png\""));
+        assert!(assets::DASHBOARD_HTML.contains("/assets/ward-logo-dark.png"));
+        assert!(assets::WARD_LOGO_DARK_SVG.contains("<rect"));
+        assert!(assets::WARD_LOGO_TRANSPARENT_SVG.contains("<svg"));
+        assert!(assets::WARD_LOGO_DARK_PNG.starts_with(b"\x89PNG"));
+        assert!(assets::WARD_FAVICON_LIGHT_PNG.starts_with(b"\x89PNG"));
+        assert!(!assets::DASHBOARD_HTML.contains("<select"));
     }
 
     #[test]
@@ -2587,7 +2423,7 @@ mod tests {
         .unwrap();
         logs::append_event(LogKind::Requests, json!({ "project": "other" })).unwrap();
 
-        let events = load_all_events(Some("demo"));
+        let events = audit::load_dashboard_events(Some("demo"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["_kind"], "request");
         assert_eq!(events[0]["payload"]["project"], "demo");
@@ -2606,7 +2442,7 @@ mod tests {
         .unwrap();
 
         let project = query_param("project=cms-core%3Award", "project").unwrap();
-        let events = load_all_events(Some(&project));
+        let events = audit::load_dashboard_events(Some(&project));
         assert_eq!(project, "cms-core:ward");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["_kind"], "execution");
@@ -2629,7 +2465,7 @@ mod tests {
         )
         .unwrap();
 
-        let events = load_all_events(Some("cms-core:ward"));
+        let events = audit::load_dashboard_events(Some("cms-core:ward"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["_project"], "cms-core:ward");
     }

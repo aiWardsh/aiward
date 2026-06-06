@@ -144,7 +144,7 @@ pub fn list_pending_requests() -> Result<Vec<PendingRequest>> {
             requests.push(pending);
         }
     }
-    requests.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    requests.sort_by_key(|request| std::cmp::Reverse(request.created_at));
     Ok(requests)
 }
 

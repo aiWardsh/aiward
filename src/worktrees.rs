@@ -118,7 +118,7 @@ pub fn list_pending_worktrees() -> Result<Vec<PendingWorktree>> {
         .values()
         .flat_map(|project| project.pending.iter().cloned())
         .collect::<Vec<_>>();
-    pending.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    pending.sort_by_key(|pending| std::cmp::Reverse(pending.created_at));
     Ok(pending)
 }
 

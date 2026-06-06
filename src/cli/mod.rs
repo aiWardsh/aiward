@@ -12,10 +12,13 @@ use dirs;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::audit::{ApprovalEvent, ExecutionEvent, ExecutionStartedEvent, RequestEvent};
 use crate::{
     agents, anomaly,
     approvals::{self, ApprovalChannel, ApprovalDecision, ApprovalScope},
-    broker, config, context, detection, env_file, git_context, grants,
+    audit, broker,
+    command_spec::CommandSpec,
+    config, context, detection, env_file, git_context, grants,
     logs::{self as audit_logs, self as logs, LogKind},
     modes, notifications, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
@@ -837,11 +840,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             env_names,
             json,
             no_prompt,
-        } => request_for_target(
+        } => request_for_target(RequestForTargetOptions {
             project,
             app,
             profile,
-            AgentContextOptions {
+            context_options: AgentContextOptions {
                 agent,
                 agent_key_id,
                 worktree,
@@ -854,7 +857,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             env_names,
             json,
             no_prompt,
-        ),
+        }),
         Commands::Allow {
             project,
             app,
@@ -864,9 +867,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             branch,
             command,
             env_names,
-        } => allow_for_target(
-            project, app, profile, scope, agent, branch, command, env_names,
-        ),
+        } => allow_for_target(AllowForTargetOptions {
+            project,
+            app,
+            profile,
+            scope,
+            agent,
+            branch,
+            command,
+            env_names,
+        }),
         Commands::Grants { command } => grants_command(command),
         Commands::Approvals { command } => approvals_command(command),
         Commands::Approve {
@@ -1061,126 +1071,6 @@ struct EnvFileEvent<'a> {
     env_file: Option<&'a Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct RequestEvent<'a> {
-    #[serde(rename = "correlationId")]
-    correlation_id: uuid::Uuid,
-    #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
-    request_id: Option<uuid::Uuid>,
-    #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
-    expires_at: Option<&'a chrono::DateTime<chrono::Utc>>,
-    access: &'a AccessRequest,
-    policy: &'a policy::PolicyEvaluation,
-    git: &'a git_context::GitContext,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verified_context: Option<&'a context::VerifiedContext>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RequestAuditSnapshot<'a> {
-    project: &'a str,
-    agent: &'a Option<String>,
-    branch: &'a Option<String>,
-    action: &'a Option<String>,
-    command: &'a str,
-    env: &'a [String],
-    requested_env: &'a [String],
-    matched_profile: &'a Option<String>,
-    matched_preset: &'a Option<String>,
-    matched_mode: &'a Option<String>,
-    policy_findings: &'a [detection::Finding],
-    git: &'a git_context::GitContext,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verified_context: Option<&'a context::VerifiedContext>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApprovalEvent<'a> {
-    correlation_id: uuid::Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request_id: Option<uuid::Uuid>,
-    project: &'a str,
-    approval_channel: ApprovalChannel,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request_snapshot: Option<RequestAuditSnapshot<'a>>,
-    decision: &'a ApprovalDecision,
-    persisted_grant: Option<uuid::Uuid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    approval_receipt_hash: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signer_key_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signature_algorithm: Option<&'a str>,
-    critical_confirmation: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    human_proof: Option<&'static str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ExecutionStartedEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    correlation_id: uuid::Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request_id: Option<uuid::Uuid>,
-    project: &'a str,
-    agent: &'a Option<String>,
-    branch: &'a Option<String>,
-    declared_action: &'a Option<String>,
-    requested_command: &'a str,
-    cwd: &'a Path,
-    git: &'a git_context::GitContext,
-    requested_env: &'a [String],
-    injected_env: &'a [String],
-    policy_findings: &'a [detection::Finding],
-    approval_scope: ApprovalScope,
-    approval_source: approvals::ApprovalSource,
-    approval_channel: ApprovalChannel,
-    grant_id: Option<uuid::Uuid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    grant_origin_request_id: Option<uuid::Uuid>,
-    approval_receipt_hash: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_key_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verified_context: Option<&'a context::VerifiedContext>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ExecutionEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    correlation_id: uuid::Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    request_id: Option<uuid::Uuid>,
-    project: &'a str,
-    agent: &'a Option<String>,
-    branch: &'a Option<String>,
-    declared_action: &'a Option<String>,
-    requested_command: &'a str,
-    cwd: &'a Path,
-    git: &'a git_context::GitContext,
-    requested_env: &'a [String],
-    injected_env: &'a [String],
-    policy_findings: &'a [detection::Finding],
-    approval_scope: ApprovalScope,
-    approval_source: approvals::ApprovalSource,
-    approval_channel: ApprovalChannel,
-    grant_id: Option<uuid::Uuid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    grant_origin_request_id: Option<uuid::Uuid>,
-    approval_receipt_hash: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_key_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verified_context: Option<&'a context::VerifiedContext>,
-    outcome: &'a runner::RunCommandOutcome,
 }
 
 #[derive(Serialize)]
@@ -2432,8 +2322,8 @@ fn trust_workspace_root_for_project(project: &str, workspace_root: &Path) -> Res
 }
 
 fn should_auto_route_workspace_setup(options: &SetupOptions) -> bool {
-    options.source == PathBuf::from(".env")
-        && options.vault == PathBuf::from(config::DEFAULT_VAULT_FILE)
+    options.source == Path::new(".env")
+        && options.vault == Path::new(config::DEFAULT_VAULT_FILE)
         && !options.commit_vault
         && !options.ignore_vault
         && !options.remove_plaintext
@@ -3049,9 +2939,9 @@ fn request(
     json: bool,
     no_prompt: bool,
 ) -> Result<()> {
-    request_for_target(
-        None,
-        None,
+    request_for_target(RequestForTargetOptions {
+        project: None,
+        app: None,
         profile,
         context_options,
         action,
@@ -3059,10 +2949,10 @@ fn request(
         env_names,
         json,
         no_prompt,
-    )
+    })
 }
 
-fn request_for_target(
+struct RequestForTargetOptions {
     project: Option<String>,
     app: Option<String>,
     profile: Option<String>,
@@ -3072,7 +2962,20 @@ fn request_for_target(
     env_names: Vec<String>,
     json: bool,
     no_prompt: bool,
-) -> Result<()> {
+}
+
+fn request_for_target(options: RequestForTargetOptions) -> Result<()> {
+    let RequestForTargetOptions {
+        project,
+        app,
+        profile,
+        context_options,
+        action,
+        command,
+        env_names,
+        json,
+        no_prompt,
+    } = options;
     let cwd = env::current_dir()?;
     let target =
         workspace_target::resolve_one(&workspace_target::TargetSelector::one(project, app), &cwd)?;
@@ -3130,7 +3033,7 @@ fn request_for_target(
 
     let correlation_id = uuid::Uuid::new_v4();
     let decision = decide_access(&access, &evaluation, true)?;
-    let critical_confirmation = critical_confirmation_for_decision(&decision, &evaluation);
+    let critical_confirmation = audit::critical_confirmation_for_decision(&decision, &evaluation);
     let receipt_context = Some(grants::GrantReceiptContext::synthetic(
         critical_confirmation,
     ));
@@ -3149,12 +3052,12 @@ fn request_for_target(
         git: &git,
         verified_context: None,
     };
-    let request_snapshot = request_audit_snapshot(&access, &evaluation, &git, None);
+    let request_snapshot = audit::request_snapshot(&access, &evaluation, &git, None);
     let approval_event = ApprovalEvent {
         correlation_id,
         request_id: None,
         project: &access.project,
-        approval_channel: approval_channel_for_source(decision.source),
+        approval_channel: audit::channel_for_source(decision.source),
         request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: persisted_grant.as_ref().map(|grant| grant.id),
@@ -3162,10 +3065,10 @@ fn request_for_target(
         signer_key_id: receipt.map(|receipt| receipt.signer_key_id.as_str()),
         signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.as_str()),
         critical_confirmation,
-        human_proof: approval_human_proof(decision.source),
+        human_proof: audit::human_proof(decision.source),
     };
     audit_logs::append_event(LogKind::Requests, request_event)?;
-    if should_log_approval_event(&decision) {
+    if audit::should_log_approval_event(&decision) {
         audit_logs::append_event(LogKind::Approvals, &approval_event)?;
     }
 
@@ -3189,12 +3092,19 @@ fn allow(
     command: Option<String>,
     env_names: Vec<String>,
 ) -> Result<()> {
-    allow_for_target(
-        None, None, profile, scope, agent, branch, command, env_names,
-    )
+    allow_for_target(AllowForTargetOptions {
+        project: None,
+        app: None,
+        profile,
+        scope,
+        agent,
+        branch,
+        command,
+        env_names,
+    })
 }
 
-fn allow_for_target(
+struct AllowForTargetOptions {
     project: Option<String>,
     app: Option<String>,
     profile: Option<String>,
@@ -3203,7 +3113,19 @@ fn allow_for_target(
     branch: Option<String>,
     command: Option<String>,
     env_names: Vec<String>,
-) -> Result<()> {
+}
+
+fn allow_for_target(options: AllowForTargetOptions) -> Result<()> {
+    let AllowForTargetOptions {
+        project,
+        app,
+        profile,
+        scope,
+        agent,
+        branch,
+        command,
+        env_names,
+    } = options;
     let cwd = env::current_dir()?;
     let target =
         workspace_target::resolve_one(&workspace_target::TargetSelector::one(project, app), &cwd)?;
@@ -3251,7 +3173,7 @@ fn allow_for_target(
     let receipt = grant.receipt.as_ref();
     let mut decision = grants::approval_from_grant(&access, &grant);
     decision.source = approvals::ApprovalSource::ManualAllow;
-    let request_snapshot = request_audit_snapshot(&access, &evaluation, &git, None);
+    let request_snapshot = audit::request_snapshot(&access, &evaluation, &git, None);
     let approval_event = ApprovalEvent {
         correlation_id,
         request_id: None,
@@ -3264,7 +3186,7 @@ fn allow_for_target(
         signer_key_id: receipt.map(|receipt| receipt.signer_key_id.as_str()),
         signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.as_str()),
         critical_confirmation: false,
-        human_proof: approval_human_proof(decision.source),
+        human_proof: audit::human_proof(decision.source),
     };
     audit_logs::append_event(LogKind::Approvals, approval_event)?;
     println!("Created {} grant {}", scope, grant.id);
@@ -3389,7 +3311,7 @@ fn approve(
         scope,
         confirm_critical,
         agent_mediated,
-        approval_channel_for_terminal(agent_mediated),
+        audit::terminal_channel(agent_mediated),
     ) {
         Ok(response) => {
             if json {
@@ -3461,7 +3383,7 @@ fn approve_inner(
     let receipt = grant.receipt.as_ref();
     let mut decision = grants::approval_from_grant(&pending.access, &grant);
     decision.source = source;
-    let request_snapshot = request_audit_snapshot(
+    let request_snapshot = audit::request_snapshot(
         &pending.access,
         &pending.policy,
         &pending.git,
@@ -3479,7 +3401,7 @@ fn approve_inner(
         signer_key_id: receipt.map(|receipt| receipt.signer_key_id.as_str()),
         signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.as_str()),
         critical_confirmation: critical && confirm_critical,
-        human_proof: approval_human_proof(source),
+        human_proof: audit::human_proof(source),
     };
     audit_logs::append_event(LogKind::Approvals, approval_event)?;
     Ok(ApproveJsonResponse {
@@ -3547,8 +3469,8 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         source,
         grant_id: None,
     };
-    let approval_channel = approval_channel_for_terminal(agent_mediated);
-    let request_snapshot = request_audit_snapshot(
+    let approval_channel = audit::terminal_channel(agent_mediated);
+    let request_snapshot = audit::request_snapshot(
         &pending.access,
         &pending.policy,
         &pending.git,
@@ -3566,7 +3488,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         signer_key_id: None,
         signature_algorithm: None,
         critical_confirmation: false,
-        human_proof: approval_human_proof(source),
+        human_proof: audit::human_proof(source),
     };
     audit_logs::append_event(LogKind::Approvals, approval_event)?;
     if json {
@@ -3598,7 +3520,7 @@ pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Valu
         source,
         grant_id: None,
     };
-    let request_snapshot = request_audit_snapshot(
+    let request_snapshot = audit::request_snapshot(
         &pending.access,
         &pending.policy,
         &pending.git,
@@ -3616,7 +3538,7 @@ pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Valu
         signer_key_id: None,
         signature_algorithm: None,
         critical_confirmation: false,
-        human_proof: approval_human_proof(source),
+        human_proof: audit::human_proof(source),
     };
     audit_logs::append_event(LogKind::Approvals, approval_event)?;
     Ok(serde_json::json!({
@@ -3844,12 +3766,12 @@ fn run_with_context(
                 verified_context: verified_context.as_ref(),
             };
             let request_snapshot =
-                request_audit_snapshot(&access, &evaluation, &git, verified_context.as_ref());
+                audit::request_snapshot(&access, &evaluation, &git, verified_context.as_ref());
             let approval_event = ApprovalEvent {
                 correlation_id,
                 request_id: linked_request_id,
                 project: &access.project,
-                approval_channel: approval_channel_for_source(decision.source),
+                approval_channel: audit::channel_for_source(decision.source),
                 request_snapshot: Some(request_snapshot),
                 decision: &decision,
                 persisted_grant: None,
@@ -3857,7 +3779,7 @@ fn run_with_context(
                 signer_key_id: None,
                 signature_algorithm: None,
                 critical_confirmation: false,
-                human_proof: approval_human_proof(decision.source),
+                human_proof: audit::human_proof(decision.source),
             };
             audit_logs::append_event(LogKind::Requests, request_event)?;
             audit_logs::append_event(LogKind::Approvals, approval_event)?;
@@ -3875,7 +3797,7 @@ fn run_with_context(
     } else {
         decide_access(&access, &evaluation, true)?
     };
-    let critical_confirmation = critical_confirmation_for_decision(&decision, &evaluation);
+    let critical_confirmation = audit::critical_confirmation_for_decision(&decision, &evaluation);
     let receipt_context = Some(grants::GrantReceiptContext {
         request_id: uuid::Uuid::new_v4(),
         pending_request: false,
@@ -3898,8 +3820,8 @@ fn run_with_context(
         verified_context: verified_context.as_ref(),
     };
     let request_snapshot =
-        request_audit_snapshot(&access, &evaluation, &git, verified_context.as_ref());
-    let approval_channel = approval_channel_for_source(decision.source);
+        audit::request_snapshot(&access, &evaluation, &git, verified_context.as_ref());
+    let approval_channel = audit::channel_for_source(decision.source);
     let approval_event = ApprovalEvent {
         correlation_id,
         request_id: linked_request_id,
@@ -3912,10 +3834,10 @@ fn run_with_context(
         signer_key_id: receipt.map(|receipt| receipt.signer_key_id.as_str()),
         signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.as_str()),
         critical_confirmation,
-        human_proof: approval_human_proof(decision.source),
+        human_proof: audit::human_proof(decision.source),
     };
     audit_logs::append_event(LogKind::Requests, request_event)?;
-    if should_log_approval_event(&decision) {
+    if audit::should_log_approval_event(&decision) {
         audit_logs::append_event(LogKind::Approvals, approval_event)?;
     }
 
@@ -3978,80 +3900,40 @@ fn run_with_context(
         let context = verified_context
             .as_ref()
             .expect("verified in no-prompt mode");
-        let Some(outcome) = execute_no_prompt_with_optional_wait(
-            &resolved,
-            &cwd,
-            &decision,
-            &command_args,
+        let Some(outcome) = execute_no_prompt_with_optional_wait(NoPromptExecutionRequest {
+            resolved: &resolved,
+            cwd: &cwd,
+            decision: &decision,
+            command_args: &command_args,
             execute_payload,
             context,
-            &access,
-            &evaluation,
-            options.wait_for_approval,
-            &options.approval_timeout,
-        )?
+            access: &access,
+            evaluation: &evaluation,
+            wait_for_approval: options.wait_for_approval,
+            approval_timeout: &options.approval_timeout,
+        })?
         else {
             return Ok(());
         };
         outcome
     } else {
-        match broker::execute(
-            &resolved.name,
-            &resolved.vault,
-            &cwd,
-            decision.approved_env.clone(),
-            command_args.clone(),
-            if human_terminal {
+        execute_with_broker_or_local_fallback(BrokerExecutionRequest {
+            project: &resolved.name,
+            vault: &resolved.vault,
+            cwd: &cwd,
+            env_names: decision.approved_env.clone(),
+            command_args,
+            authorization: if human_terminal {
                 broker::ExecuteAuthorization::Human {
                     shell_pid: crate::human::current_shell_pid(),
                 }
             } else {
                 broker::ExecuteAuthorization::Internal {
-                    payload: execute_payload,
+                    payload: Box::new(execute_payload),
                 }
             },
-        ) {
-            Ok(outcome) => outcome,
-            Err(broker_err) => {
-                if broker_execution_rejection_is_authoritative(&broker_err) {
-                    anyhow::bail!("broker rejected execution: {broker_err}");
-                }
-                // If an active unlock session exists but the broker isn't running,
-                // the vault may be session-encrypted. Direct decryption won't work.
-                let fallback_passphrase = match unlock::active_run_lookup(
-                    &resolved.name,
-                    &resolved.vault,
-                )? {
-                    unlock::RunUnlockLookup::Available(passphrase) => Some(passphrase),
-                    unlock::RunUnlockLookup::MaterialUnavailable { .. } => {
-                        anyhow::bail!(
-                                "broker session exists but broker is not running ({})\nRun `ward unlock` to restore the session.",
-                                broker_err
-                            );
-                    }
-                    unlock::RunUnlockLookup::Missing => None,
-                };
-                let passphrase = match fallback_passphrase {
-                    Some(passphrase) => passphrase,
-                    None => vault::read_existing_passphrase()?,
-                };
-                runner::run_command(RunCommandRequest {
-                    cwd: cwd.clone(),
-                    vault: resolved.vault.clone(),
-                    env_names: decision.approved_env.clone(),
-                    command: command_args,
-                    passphrase,
-                    inherited_env: std::env::vars().collect(),
-                    cancellation: None,
-                    human_shell_pid: if human_terminal {
-                        Some(crate::human::current_shell_pid())
-                    } else {
-                        None
-                    },
-                    child_pid: None,
-                })?
-            }
-        }
+            human_shell_pid: human_terminal.then(crate::human::current_shell_pid),
+        })?
     };
 
     let execution_event = ExecutionEvent {
@@ -4101,6 +3983,64 @@ fn run_with_context(
     }
 
     Ok(())
+}
+
+struct BrokerExecutionRequest<'a> {
+    project: &'a str,
+    vault: &'a Path,
+    cwd: &'a Path,
+    env_names: Vec<String>,
+    command_args: Vec<String>,
+    authorization: broker::ExecuteAuthorization,
+    human_shell_pid: Option<u32>,
+}
+
+fn execute_with_broker_or_local_fallback(
+    request: BrokerExecutionRequest<'_>,
+) -> Result<runner::RunCommandOutcome> {
+    match broker::execute(
+        request.project,
+        request.vault,
+        request.cwd,
+        request.env_names.clone(),
+        request.command_args.clone(),
+        request.authorization,
+    ) {
+        Ok(outcome) => Ok(outcome),
+        Err(broker_err) => {
+            if broker_execution_rejection_is_authoritative(&broker_err) {
+                anyhow::bail!("broker rejected execution: {broker_err}");
+            }
+            let fallback_passphrase = match unlock::active_run_lookup(
+                request.project,
+                request.vault,
+            )? {
+                unlock::RunUnlockLookup::Available(passphrase) => Some(passphrase),
+                unlock::RunUnlockLookup::MaterialUnavailable { .. } => {
+                    anyhow::bail!(
+                        "broker session exists but broker is not running ({})\nRun `ward unlock` to restore the session.",
+                        broker_err
+                    );
+                }
+                unlock::RunUnlockLookup::Missing => None,
+            };
+            let passphrase = match fallback_passphrase {
+                Some(passphrase) => passphrase,
+                None => vault::read_existing_passphrase()?,
+            };
+            runner::run_command(RunCommandRequest {
+                cwd: request.cwd.to_path_buf(),
+                vault: request.vault.to_path_buf(),
+                env_names: request.env_names,
+                command: request.command_args,
+                passphrase,
+                inherited_env: std::env::vars().collect(),
+                cancellation: None,
+                human_shell_pid: request.human_shell_pid,
+                child_pid: None,
+            })
+        }
+    }
 }
 
 fn reject_misplaced_run_flags(command: &[String]) -> Result<bool> {
@@ -4685,7 +4625,7 @@ pub(crate) fn create_run_unlock_session(
         ttl,
         mode.map(str::to_string),
     )
-    .map_err(|error| {
+    .inspect_err(|error| {
         let error_message = error.to_string();
         let event = VaultUnlockEvent {
             event_type: "vault.unlock",
@@ -4696,7 +4636,6 @@ pub(crate) fn create_run_unlock_session(
             expires_at: None,
         };
         let _ = audit_logs::append_event(LogKind::Sessions, event);
-        error
     })?;
 
     #[cfg(not(test))]
@@ -5276,7 +5215,7 @@ fn is_safe_shell_function_name(name: &str) -> bool {
         "read", "printf", "test", "[", "[[", "true", "false", "return", "break", "continue",
         "shift", "trap",
     ];
-    if BUILTINS.iter().any(|b| *b == name) {
+    if BUILTINS.contains(&name) {
         return false;
     }
     name.chars()
@@ -5673,7 +5612,7 @@ fn teardown(
     let cwd = env::current_dir()?;
     let selector = workspace_target::TargetSelector::one(project, app);
     let initial = workspace_target::resolve_one(&selector, &cwd)?.resolved_project();
-    let export_path = if restore_env && export_path == PathBuf::from(".env.export") {
+    let export_path = if restore_env && export_path == Path::new(".env.export") {
         PathBuf::from(".env")
     } else {
         export_path
@@ -5825,9 +5764,10 @@ fn resolve_profile(
         let Some(profile) = config.profiles.get(profile_name) else {
             anyhow::bail!("profile {profile_name} is not defined in .ward.json");
         };
+        let command_spec = CommandSpec::from_profile_command(&profile.command);
         return Ok(ResolvedProfile {
-            command: profile.command.clone(),
-            command_args: split_profile_command(&profile.command),
+            command: command_spec.display,
+            command_args: command_spec.argv,
             env_names: profile.env.clone(),
             action: action.or_else(|| Some(profile.action.clone())),
             default_scope: profile.default_scope,
@@ -5838,9 +5778,10 @@ fn resolve_profile(
     if env_names.is_empty() {
         anyhow::bail!("at least one --env is required unless --profile is used");
     }
+    let command_spec = CommandSpec::from_profile_command(&command);
     Ok(ResolvedProfile {
-        command: command.clone(),
-        command_args: split_profile_command(&command),
+        command: command_spec.display,
+        command_args: command_spec.argv,
         env_names,
         action,
         default_scope: ApprovalScope::Once,
@@ -5862,9 +5803,10 @@ fn resolve_run_profile(
         let Some(profile) = config.profiles.get(profile_name) else {
             anyhow::bail!("profile {profile_name} is not defined in .ward.json");
         };
+        let command_spec = CommandSpec::from_profile_command(&profile.command);
         return Ok(ResolvedProfile {
-            command: profile.command.clone(),
-            command_args: split_profile_command(&profile.command),
+            command: command_spec.display,
+            command_args: command_spec.argv,
             env_names: profile.env.clone(),
             action: action.or_else(|| Some(profile.action.clone())),
             default_scope: profile.default_scope,
@@ -5877,20 +5819,14 @@ fn resolve_run_profile(
     if env_names.is_empty() && !allow_empty_env {
         anyhow::bail!("at least one --env is required unless --profile is used");
     }
+    let command_spec = CommandSpec::from_args(command);
     Ok(ResolvedProfile {
-        command: command.join(" "),
-        command_args: command,
+        command: command_spec.display,
+        command_args: command_spec.argv,
         env_names,
         action,
         default_scope: ApprovalScope::Once,
     })
-}
-
-fn split_profile_command(command: &str) -> Vec<String> {
-    command
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<Vec<_>>()
 }
 
 fn effective_grant_id(
@@ -5946,48 +5882,6 @@ fn evaluate_access(
     policy::evaluate_request(config, access, None, findings)
 }
 
-fn request_audit_snapshot<'a>(
-    access: &'a AccessRequest,
-    evaluation: &'a policy::PolicyEvaluation,
-    git: &'a git_context::GitContext,
-    verified_context: Option<&'a context::VerifiedContext>,
-) -> RequestAuditSnapshot<'a> {
-    RequestAuditSnapshot {
-        project: &access.project,
-        agent: &access.agent,
-        branch: &access.branch,
-        action: &access.action,
-        command: &access.command,
-        env: &access.env,
-        requested_env: &evaluation.requested_env,
-        matched_profile: &evaluation.matched_profile,
-        matched_preset: &evaluation.matched_preset,
-        matched_mode: &evaluation.matched_mode,
-        policy_findings: &evaluation.findings,
-        git,
-        verified_context,
-    }
-}
-
-fn approval_channel_for_source(source: approvals::ApprovalSource) -> ApprovalChannel {
-    match source {
-        approvals::ApprovalSource::LocalTty => ApprovalChannel::LocalPrompt,
-        approvals::ApprovalSource::ManualAllow => ApprovalChannel::ManualAllow,
-        approvals::ApprovalSource::AgentMediated => ApprovalChannel::AgentMediatedCli,
-        approvals::ApprovalSource::Grant => ApprovalChannel::GrantReuse,
-        approvals::ApprovalSource::PolicyAuto => ApprovalChannel::PolicyAuto,
-        approvals::ApprovalSource::PolicyDeny => ApprovalChannel::PolicyDeny,
-    }
-}
-
-fn approval_channel_for_terminal(agent_mediated: bool) -> ApprovalChannel {
-    if agent_mediated {
-        ApprovalChannel::AgentMediatedCli
-    } else {
-        ApprovalChannel::TerminalApprove
-    }
-}
-
 fn grant_origin_request_id(decision: &ApprovalDecision) -> Option<uuid::Uuid> {
     if decision.source != approvals::ApprovalSource::Grant {
         return None;
@@ -5998,28 +5892,6 @@ fn grant_origin_request_id(decision: &ApprovalDecision) -> Option<uuid::Uuid> {
         .into_iter()
         .find(|grant| grant.id == grant_id)
         .and_then(|grant| grant.request_id)
-}
-
-fn should_log_approval_event(decision: &ApprovalDecision) -> bool {
-    decision.source != approvals::ApprovalSource::Grant
-}
-
-fn approval_human_proof(source: approvals::ApprovalSource) -> Option<&'static str> {
-    match source {
-        approvals::ApprovalSource::AgentMediated => Some("external-agent-ui"),
-        approvals::ApprovalSource::LocalTty => Some("local-tty"),
-        approvals::ApprovalSource::ManualAllow => Some("local-cli"),
-        _ => None,
-    }
-}
-
-fn critical_confirmation_for_decision(
-    decision: &ApprovalDecision,
-    evaluation: &policy::PolicyEvaluation,
-) -> bool {
-    decision.approved
-        && decision.scope == ApprovalScope::Once
-        && detection::has_critical_findings(&evaluation.findings)
 }
 
 fn handle_post_run_logging_result(exit_code: i32, result: Result<()>) -> Result<()> {
@@ -6288,18 +6160,34 @@ fn wait_for_run_approval(
     }
 }
 
-fn execute_no_prompt_with_optional_wait(
-    resolved: &registry::ResolvedProject,
-    cwd: &Path,
-    decision: &ApprovalDecision,
-    command_args: &[String],
-    mut execute_payload: broker::ExecuteAuthorizationPayload,
-    context: &context::VerifiedContext,
-    access: &AccessRequest,
-    evaluation: &policy::PolicyEvaluation,
+struct NoPromptExecutionRequest<'a> {
+    resolved: &'a registry::ResolvedProject,
+    cwd: &'a Path,
+    decision: &'a ApprovalDecision,
+    command_args: &'a [String],
+    execute_payload: broker::ExecuteAuthorizationPayload,
+    context: &'a context::VerifiedContext,
+    access: &'a AccessRequest,
+    evaluation: &'a policy::PolicyEvaluation,
     wait_for_approval: bool,
-    approval_timeout: &str,
+    approval_timeout: &'a str,
+}
+
+fn execute_no_prompt_with_optional_wait(
+    request: NoPromptExecutionRequest<'_>,
 ) -> Result<Option<runner::RunCommandOutcome>> {
+    let NoPromptExecutionRequest {
+        resolved,
+        cwd,
+        decision,
+        command_args,
+        mut execute_payload,
+        context,
+        access,
+        evaluation,
+        wait_for_approval,
+        approval_timeout,
+    } = request;
     let timeout = unlock::parse_ttl(approval_timeout)?;
     let deadline = chrono::Utc::now() + timeout;
     let mut unlock_notification = None;
@@ -6390,17 +6278,17 @@ fn create_run_block_notification(
     message: &str,
     fix_command: Option<&str>,
 ) -> Result<notifications::BlockNotification> {
-    notifications::create_block_notification(
+    notifications::create_block_notification(notifications::BlockNotificationRequest {
         kind,
-        &access.project,
-        access.agent.as_deref(),
-        Some(&access.command),
-        &access.env,
-        &evaluation.findings,
-        run_risk_summary(evaluation),
-        message,
+        project: &access.project,
+        agent: access.agent.as_deref(),
+        command: Some(&access.command),
+        env: &access.env,
+        findings: &evaluation.findings,
+        risk: run_risk_summary(evaluation),
+        message: message.to_string(),
         fix_command,
-    )
+    })
 }
 
 fn print_run_wait_denied(request_id: uuid::Uuid, access: &AccessRequest) -> Result<()> {
@@ -7256,11 +7144,29 @@ mod tests {
         sync::{Mutex, OnceLock},
     };
 
-    fn cwd_lock() -> std::sync::MutexGuard<'static, ()> {
+    struct CwdLockGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        original: Option<PathBuf>,
+    }
+
+    impl Drop for CwdLockGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.as_ref() {
+                let _ = std::env::set_current_dir(original);
+            }
+        }
+    }
+
+    fn cwd_lock() -> CwdLockGuard {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        CwdLockGuard {
+            _guard: guard,
+            original: std::env::current_dir().ok(),
+        }
     }
 
     #[test]
@@ -7773,8 +7679,9 @@ mod tests {
         .to_string();
         assert!(plaintext_conflict.contains("choose either --remove-plaintext or --keep-plaintext"));
 
-        let missing = setup(SetupOptions {
-            yes: false,
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        setup(SetupOptions {
+            yes: true,
             project: Some("demo".to_string()),
             source: "missing.env".into(),
             vault: "missing.vault".into(),
@@ -7783,11 +7690,11 @@ mod tests {
             remove_plaintext: false,
             keep_plaintext: false,
             unlock_ttl: "8h".to_string(),
-            no_unlock: false,
+            no_unlock: true,
         })
-        .unwrap_err()
-        .to_string();
-        assert!(missing.contains("missing.env does not exist"));
+        .unwrap();
+        assert!(project.path().join("missing.env").exists());
+        assert!(project.path().join("missing.vault").exists());
 
         let absolute_vault = project.path().join("absolute.env.vault");
         std::fs::write(&absolute_vault, "placeholder").unwrap();
@@ -7813,6 +7720,7 @@ mod tests {
 
         std::env::set_current_dir(old_cwd).unwrap();
         std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -8421,6 +8329,10 @@ mod tests {
             },
         })
         .unwrap();
+        let imported_demo_vault = registry::resolve_project(Some("demo"), project.path())
+            .unwrap()
+            .vault;
+        std::fs::copy(&imported_demo_vault, project.path().join(".env.vault")).unwrap();
         let mut config_after_alt_import = config::read_project_config(project.path()).unwrap();
         config_after_alt_import.vault = ".env.vault".into();
         config::write_project_config(project.path(), &config_after_alt_import, true).unwrap();
@@ -9406,15 +9318,18 @@ mod tests {
         invalid_grant.id = uuid::Uuid::new_v4();
         invalid_grant.receipt = Some(crate::approval_receipts::ApprovalReceipt {
             payload: crate::approval_receipts::build_payload(
-                &access(),
-                invalid_grant.id,
-                uuid::Uuid::new_v4(),
-                &["DATABASE_URL".to_string()],
-                approvals::ApprovalScope::Always,
-                None,
-                false,
-                now,
-                "missing-signer".to_string(),
+                crate::approval_receipts::PayloadBuildRequest {
+                    access: &access(),
+                    grant_id: invalid_grant.id,
+                    request_id: uuid::Uuid::new_v4(),
+                    approved_env: &["DATABASE_URL".to_string()],
+                    scope: approvals::ApprovalScope::Always,
+                    expires_at: None,
+                    critical_confirmation: false,
+                    created_at: now,
+                    signer_key_id: "missing-signer".to_string(),
+                    verified_context: None,
+                },
             ),
             payload_hash: "bad".to_string(),
             signer_key_id: "missing-signer".to_string(),

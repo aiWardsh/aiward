@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{broker, fs_util, logs, term};
+use crate::{broker, fs_util, logs, process_util, term};
 use base64::Engine as _;
 
 const HUMAN_ACTIVATION_BODY: &str =
@@ -200,19 +200,7 @@ pub fn serve_guardian(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> 
 }
 
 pub fn process_exists(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: kill(pid, 0) does not send a signal; it only checks process visibility.
-        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    process_util::process_exists(pid)
 }
 
 // ── Shutdown from lock() ──────────────────────────────────────────────────────
@@ -500,15 +488,11 @@ fn stale_human_run_dirs() -> Vec<PathBuf> {
 }
 
 fn terminate_process(pid: u32) {
-    #[cfg(unix)]
-    {
-        // SAFETY: sends SIGTERM to a Ward guardian process selected by command line.
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
+    process_util::terminate_if_matches(pid, Duration::from_secs(1), |target| {
+        guardian_processes()
+            .into_iter()
+            .any(|guardian| guardian.pid == target)
+    });
 }
 
 fn format_ttl_label(ttl_seconds: i64) -> String {

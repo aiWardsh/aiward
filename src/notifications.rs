@@ -93,29 +93,33 @@ pub fn notification_dir() -> PathBuf {
     logs::ward_home().join("notifications")
 }
 
+pub struct BlockNotificationRequest<'a> {
+    pub kind: NotificationKind,
+    pub project: &'a str,
+    pub agent: Option<&'a str>,
+    pub command: Option<&'a str>,
+    pub env: &'a [String],
+    pub findings: &'a [Finding],
+    pub risk: String,
+    pub message: String,
+    pub fix_command: Option<&'a str>,
+}
+
 pub fn create_block_notification(
-    kind: NotificationKind,
-    project: &str,
-    agent: Option<&str>,
-    command: Option<&str>,
-    env: &[String],
-    findings: &[Finding],
-    risk: impl Into<String>,
-    message: impl Into<String>,
-    fix_command: Option<&str>,
+    request: BlockNotificationRequest<'_>,
 ) -> Result<BlockNotification> {
     let now = Utc::now();
     let notification = BlockNotification {
         id: uuid::Uuid::new_v4(),
-        kind,
-        project: project.to_string(),
-        agent: agent.map(str::to_string),
-        command: command.map(str::to_string),
-        env: env.to_vec(),
-        findings: findings.to_vec(),
-        risk: risk.into(),
-        message: message.into(),
-        fix_command: fix_command.map(str::to_string),
+        kind: request.kind,
+        project: request.project.to_string(),
+        agent: request.agent.map(str::to_string),
+        command: request.command.map(str::to_string),
+        env: request.env.to_vec(),
+        findings: request.findings.to_vec(),
+        risk: request.risk,
+        message: request.message,
+        fix_command: request.fix_command.map(str::to_string),
         created_at: now,
         expires_at: now + chrono::Duration::minutes(30),
     };
@@ -142,7 +146,7 @@ pub fn list_notifications() -> Result<Vec<Notification>> {
     for block in list_block_notifications()? {
         notifications.push(block_notification(&block));
     }
-    notifications.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    notifications.sort_by_key(|notification| std::cmp::Reverse(notification.created_at));
     Ok(notifications)
 }
 
@@ -351,17 +355,17 @@ mod tests {
         let pending =
             pending_requests::create_pending_request(access(), evaluation(), GitContext::default())
                 .unwrap();
-        create_block_notification(
-            NotificationKind::UnlockRequired,
-            "demo",
-            Some("codex"),
-            Some("pnpm dev"),
-            &["DATABASE_URL".to_string()],
-            &[],
-            "warning",
-            "unlock needed",
-            Some("ward unlock --ttl 8h"),
-        )
+        create_block_notification(BlockNotificationRequest {
+            kind: NotificationKind::UnlockRequired,
+            project: "demo",
+            agent: Some("codex"),
+            command: Some("pnpm dev"),
+            env: &["DATABASE_URL".to_string()],
+            findings: &[],
+            risk: "warning".to_string(),
+            message: "unlock needed".to_string(),
+            fix_command: Some("ward unlock --ttl 8h"),
+        })
         .unwrap();
 
         let notifications = list_notifications().unwrap();

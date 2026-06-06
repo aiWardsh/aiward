@@ -475,8 +475,10 @@ mod tests {
             .output()
             .unwrap();
 
-        let mut registry = Registry::default();
-        registry.active_project = Some("active".to_string());
+        let mut registry = Registry {
+            active_project: Some("active".to_string()),
+            ..Registry::default()
+        };
         registry.projects.insert(
             "remote".to_string(),
             RegisteredProject {

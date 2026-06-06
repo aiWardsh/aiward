@@ -9,13 +9,12 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration as StdDuration,
 };
 #[cfg(not(test))]
 use std::{
     os::unix::io::AsRawFd,
     process::{Command, Stdio},
-    time::Instant,
+    time::{Duration as StdDuration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -28,7 +27,8 @@ use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
     approvals::{ApprovalScope, ApprovalSource},
-    config, detection, env_file, fs_util, logs, modes, project_store, recovery, registry,
+    config, detection, env_file, fs_util, logs, modes, process_util, project_store, recovery,
+    registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
     vault,
 };
@@ -150,7 +150,7 @@ pub enum ExecuteAuthorization {
         shell_pid: u32,
     },
     Internal {
-        payload: ExecuteAuthorizationPayload,
+        payload: Box<ExecuteAuthorizationPayload>,
     },
 }
 
@@ -426,7 +426,7 @@ fn stop_existing_broker(status: &BrokerStatus) {
         if let Some(pid) = pid {
             let deadline = Instant::now() + StdDuration::from_secs(2);
             while Instant::now() < deadline {
-                if !process_exists(pid) {
+                if !process_util::process_exists(pid) {
                     return;
                 }
                 thread::sleep(StdDuration::from_millis(50));
@@ -442,42 +442,14 @@ fn stop_existing_broker(status: &BrokerStatus) {
 
 #[cfg(not(test))]
 fn terminate_broker_process(pid: u32) {
-    if !is_broker_process(pid) {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: target pid is selected by command-line inspection.
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        let deadline = Instant::now() + StdDuration::from_secs(1);
-        while Instant::now() < deadline {
-            if !process_exists(pid) {
-                return;
-            }
-            thread::sleep(StdDuration::from_millis(50));
-        }
-        // SAFETY: best-effort hard stop for the same broker process if SIGTERM was ignored.
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    }
+    process_util::terminate_if_matches(pid, StdDuration::from_secs(1), is_broker_process);
 }
 
 #[cfg(not(test))]
 fn is_broker_process(pid: u32) -> bool {
-    command_line(pid)
+    process_util::command_line(pid)
         .map(|line| line.contains("__broker") && line.contains("ward"))
         .unwrap_or(false)
-}
-
-#[cfg(not(test))]
-fn command_line(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(not(test))]
@@ -1335,7 +1307,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                             if line.is_empty() || line.starts_with('#') {
                                 return None;
                             }
-                            line.splitn(2, '=').next().map(str::to_string)
+                            line.split('=').next().map(str::to_string)
                         })
                         .collect::<Vec<_>>();
                     Ok(names)
@@ -1375,17 +1347,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             match setup_project_with_passphrase(&target_path, project.as_deref(), &passphrase) {
                 Ok(status) => {
                     let new_session_key =
-                        match vault::decrypt_vault_file(&status.vault, &passphrase).and_then(
-                            |plaintext| {
-                                let ephemeral_key = generate_session_key();
-                                let envelope = vault::encrypt_env(&plaintext, &ephemeral_key)?;
-                                vault::write_vault(&status.vault, &envelope)?;
-                                Ok(ephemeral_key)
-                            },
-                        ) {
-                            Ok(ephemeral_key) => Some(ephemeral_key),
-                            Err(_) => None,
-                        };
+                        reencrypt_vault_with_session_key(&status.vault, &passphrase);
                     state
                         .lock()
                         .expect("broker state poisoned")
@@ -1463,33 +1425,24 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     return Ok(false);
                 }
             };
-            match {
+            let provision_result = {
                 let passphrase = material.passphrase.clone();
-                provision_project_with_material(
-                    &source_project,
-                    &source_vault,
-                    &target_path,
-                    &project,
+                provision_project_with_material(ProjectProvisionMaterialRequest {
+                    source_project: &source_project,
+                    source_vault: &source_vault,
+                    target_path: &target_path,
+                    project: &project,
                     profiles,
                     env_names,
                     agents,
-                    &material,
-                )
+                    material: &material,
+                })
                 .map(|(status, expires_at)| (status, expires_at, passphrase))
-            } {
+            };
+            match provision_result {
                 Ok((status, expires_at, passphrase)) => {
                     let new_session_key =
-                        match vault::decrypt_vault_file(&status.vault, &passphrase).and_then(
-                            |plaintext| {
-                                let ephemeral_key = generate_session_key();
-                                let envelope = vault::encrypt_env(&plaintext, &ephemeral_key)?;
-                                vault::write_vault(&status.vault, &envelope)?;
-                                Ok(ephemeral_key)
-                            },
-                        ) {
-                            Ok(ephemeral_key) => Some(ephemeral_key),
-                            Err(_) => None,
-                        };
+                        reencrypt_vault_with_session_key(&status.vault, &passphrase);
                     state
                         .lock()
                         .expect("broker state poisoned")
@@ -1575,16 +1528,30 @@ fn snapshot_project_with_material(
     Ok(BrokerProjectSnapshotStatus { store })
 }
 
-fn provision_project_with_material(
-    source_project: &str,
-    source_vault: &Path,
-    target_path: &Path,
-    project: &str,
+struct ProjectProvisionMaterialRequest<'a> {
+    source_project: &'a str,
+    source_vault: &'a Path,
+    target_path: &'a Path,
+    project: &'a str,
     profiles: Vec<String>,
     env_names: Vec<String>,
     agents: Vec<String>,
-    material: &ActiveProjectMaterial,
+    material: &'a ActiveProjectMaterial,
+}
+
+fn provision_project_with_material(
+    request: ProjectProvisionMaterialRequest<'_>,
 ) -> Result<(BrokerProjectProvisionStatus, DateTime<Utc>)> {
+    let ProjectProvisionMaterialRequest {
+        source_project,
+        source_vault,
+        target_path,
+        project,
+        profiles,
+        env_names,
+        agents,
+        material,
+    } = request;
     validate_project_name(project)?;
     let selected_env = normalize_env_names(env_names)?;
     if selected_env.is_empty() {
@@ -1953,7 +1920,7 @@ fn validate_human_session(state: &BrokerState, shell_pid: u32) -> std::result::R
             "Ward human mode expired for this terminal; run ward human (shell pid: {shell_pid})"
         ));
     }
-    if !process_exists(shell_pid) {
+    if !process_util::process_exists(shell_pid) {
         return Err(format!(
             "Ward human shell is no longer running; run ward human in the active terminal (shell pid: {shell_pid})"
         ));
@@ -2288,7 +2255,7 @@ fn cancel_human_commands(state: &mut BrokerState, shell_pid: u32) {
             command.cancellation.store(true, Ordering::SeqCst);
             let child_pid = command.child_pid.load(Ordering::SeqCst);
             if child_pid != 0 {
-                terminate_process_group(child_pid);
+                process_util::terminate_process_group(child_pid);
             }
         }
     }
@@ -2307,7 +2274,7 @@ fn cleanup_inactive_human_sessions(state: &mut BrokerState) {
         .human_sessions
         .iter()
         .filter_map(|(shell_pid, entry)| {
-            if entry.expires_at <= now || !process_exists(*shell_pid) {
+            if entry.expires_at <= now || !process_util::process_exists(*shell_pid) {
                 Some(*shell_pid)
             } else {
                 None
@@ -2347,7 +2314,7 @@ fn current_parent_pid() -> Option<u32> {
     {
         // SAFETY: getppid has no preconditions and does not mutate memory.
         let ppid = unsafe { libc::getppid() };
-        return (ppid > 0).then_some(ppid as u32);
+        (ppid > 0).then_some(ppid as u32)
     }
     #[cfg(not(unix))]
     {
@@ -2357,39 +2324,6 @@ fn current_parent_pid() -> Option<u32> {
 
 fn session_key(project: &str, vault: &Path) -> String {
     format!("{}|{}", project, vault.display())
-}
-
-fn process_exists(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: kill(pid, 0) checks process visibility without sending a signal.
-        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
-fn terminate_process_group(pid: u32) {
-    #[cfg(unix)]
-    {
-        let pgid = pid as libc::pid_t;
-        // SAFETY: sends SIGTERM to the process group created for a human-mode child.
-        let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
-        thread::sleep(StdDuration::from_millis(100));
-        // SAFETY: best-effort hard stop if the process group ignored SIGTERM.
-        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-    }
 }
 
 fn monitor_client_disconnect(mut stream: UnixStream, cancellation: Arc<AtomicBool>) {
@@ -2417,6 +2351,17 @@ fn generate_session_key() -> String {
     let mut key = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut key);
     hex::encode(key)
+}
+
+fn reencrypt_vault_with_session_key(vault: &Path, passphrase: &str) -> Option<String> {
+    vault::decrypt_vault_file(vault, passphrase)
+        .and_then(|plaintext| {
+            let ephemeral_key = generate_session_key();
+            let envelope = vault::encrypt_env(&plaintext, &ephemeral_key)?;
+            vault::write_vault(vault, &envelope)?;
+            Ok(ephemeral_key)
+        })
+        .ok()
 }
 
 fn install_shutdown_handler(state: Arc<Mutex<BrokerState>>) {
@@ -2543,7 +2488,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         Vec::new(),
         vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
         ExecuteAuthorization::Internal {
-            payload: ExecuteAuthorizationPayload::new(
+            payload: Box::new(ExecuteAuthorizationPayload::new(
                 "demo".to_string(),
                 home.path().join(".env.vault"),
                 home.path().to_path_buf(),
@@ -2551,7 +2496,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
                 vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
                 ApprovalScope::Once,
                 ApprovalSource::ManualAllow,
-            ),
+            )),
         },
     )
     .is_err());
@@ -2670,7 +2615,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
     let authorization = ExecuteAuthorization::Internal {
-        payload: ExecuteAuthorizationPayload::new(
+        payload: Box::new(ExecuteAuthorizationPayload::new(
             "demo".to_string(),
             vault_path.clone(),
             home.path().to_path_buf(),
@@ -2678,7 +2623,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
             command.clone(),
             ApprovalScope::Once,
             ApprovalSource::ManualAllow,
-        ),
+        )),
     };
     let action = || {
         execute(
@@ -2707,7 +2652,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
     let authorization = ExecuteAuthorization::Internal {
-        payload: ExecuteAuthorizationPayload::new(
+        payload: Box::new(ExecuteAuthorizationPayload::new(
             "demo".to_string(),
             vault_path.clone(),
             home.path().to_path_buf(),
@@ -2715,7 +2660,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
             command.clone(),
             ApprovalScope::Once,
             ApprovalSource::ManualAllow,
-        ),
+        )),
     };
     let action = || {
         execute(
@@ -2737,7 +2682,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
     let authorization = ExecuteAuthorization::Internal {
-        payload: ExecuteAuthorizationPayload::new(
+        payload: Box::new(ExecuteAuthorizationPayload::new(
             "demo".to_string(),
             vault_path.clone(),
             home.path().to_path_buf(),
@@ -2745,7 +2690,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
             command.clone(),
             ApprovalScope::Once,
             ApprovalSource::ManualAllow,
-        ),
+        )),
     };
     let action = || {
         execute(
@@ -2848,7 +2793,9 @@ mod tests {
         command: Vec<String>,
     ) -> ExecuteAuthorization {
         ExecuteAuthorization::Internal {
-            payload: test_execute_payload(project, vault, cwd, env_names, command),
+            payload: Box::new(test_execute_payload(
+                project, vault, cwd, env_names, command,
+            )),
         }
     }
 
@@ -3044,16 +2991,16 @@ mod tests {
             expires_at: Utc::now() + Duration::hours(1),
         };
 
-        let (status, _) = provision_project_with_material(
-            "source",
-            &source_vault,
-            &target,
-            "target",
-            vec!["dev".to_string()],
-            vec!["DATABASE_URL".to_string()],
-            vec!["codex".to_string()],
-            &material,
-        )
+        let (status, _) = provision_project_with_material(ProjectProvisionMaterialRequest {
+            source_project: "source",
+            source_vault: &source_vault,
+            target_path: &target,
+            project: "target",
+            profiles: vec!["dev".to_string()],
+            env_names: vec!["DATABASE_URL".to_string()],
+            agents: vec!["codex".to_string()],
+            material: &material,
+        })
         .unwrap();
 
         let target_plaintext = vault::decrypt_vault_file(&status.vault, "1234").unwrap();
@@ -3231,8 +3178,8 @@ mod tests {
             BrokerRequest::Sign {
                 project: "missing".to_string(),
                 vault: vault_path.clone(),
-                payload: approval_receipts::build_payload(
-                    &AccessRequest {
+                payload: approval_receipts::build_payload(approval_receipts::PayloadBuildRequest {
+                    access: &AccessRequest {
                         project: "missing".to_string(),
                         agent: Some("codex".to_string()),
                         branch: Some("main".to_string()),
@@ -3240,15 +3187,16 @@ mod tests {
                         command: "sh -c true".to_string(),
                         env: vec!["DATABASE_URL".to_string()],
                     },
-                    uuid::Uuid::new_v4(),
-                    uuid::Uuid::new_v4(),
-                    &["DATABASE_URL".to_string()],
-                    ApprovalScope::Session,
-                    None,
-                    false,
-                    Utc::now(),
-                    String::new(),
-                ),
+                    grant_id: uuid::Uuid::new_v4(),
+                    request_id: uuid::Uuid::new_v4(),
+                    approved_env: &["DATABASE_URL".to_string()],
+                    scope: ApprovalScope::Session,
+                    expires_at: None,
+                    critical_confirmation: false,
+                    created_at: Utc::now(),
+                    signer_key_id: String::new(),
+                    verified_context: None,
+                }),
             },
             Arc::clone(&state),
         );
@@ -3305,17 +3253,18 @@ mod tests {
             command: "sh -c true".to_string(),
             env: vec!["DATABASE_URL".to_string()],
         };
-        let payload = approval_receipts::build_payload(
-            &access,
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            &access.env,
-            ApprovalScope::Session,
-            Some(Utc::now() + Duration::hours(1)),
-            false,
-            Utc::now(),
-            String::new(),
-        );
+        let payload = approval_receipts::build_payload(approval_receipts::PayloadBuildRequest {
+            access: &access,
+            grant_id: uuid::Uuid::new_v4(),
+            request_id: uuid::Uuid::new_v4(),
+            approved_env: &access.env,
+            scope: ApprovalScope::Session,
+            expires_at: Some(Utc::now() + Duration::hours(1)),
+            critical_confirmation: false,
+            created_at: Utc::now(),
+            signer_key_id: String::new(),
+            verified_context: None,
+        });
         let (_, response) = broker_pair(
             BrokerRequest::Sign {
                 project: "demo".to_string(),
@@ -3490,7 +3439,7 @@ mod tests {
                 command: command.clone(),
                 inherited_env: inherited_execution_env(),
                 authorization: Some(ExecuteAuthorization::Internal {
-                    payload: mismatched_payload,
+                    payload: Box::new(mismatched_payload),
                 }),
             },
             Arc::clone(&state),
@@ -3570,17 +3519,19 @@ mod tests {
             command: "sh -c true".to_string(),
             env: env_names.clone(),
         };
-        let sign_payload = approval_receipts::build_payload(
-            &access,
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            &env_names,
-            ApprovalScope::Session,
-            None,
-            false,
-            Utc::now(),
-            String::new(),
-        );
+        let sign_payload =
+            approval_receipts::build_payload(approval_receipts::PayloadBuildRequest {
+                access: &access,
+                grant_id: uuid::Uuid::new_v4(),
+                request_id: uuid::Uuid::new_v4(),
+                approved_env: &env_names,
+                scope: ApprovalScope::Session,
+                expires_at: None,
+                critical_confirmation: false,
+                created_at: Utc::now(),
+                signer_key_id: String::new(),
+                verified_context: None,
+            });
         let (_, response) = broker_pair(
             BrokerRequest::Sign {
                 project: "demo".to_string(),
@@ -3639,17 +3590,18 @@ mod tests {
             command: "sh -c true".to_string(),
             env: vec!["DATABASE_URL".to_string()],
         };
-        let payload = approval_receipts::build_payload(
-            &access,
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            &access.env,
-            ApprovalScope::Session,
-            None,
-            false,
-            Utc::now(),
-            String::new(),
-        );
+        let payload = approval_receipts::build_payload(approval_receipts::PayloadBuildRequest {
+            access: &access,
+            grant_id: uuid::Uuid::new_v4(),
+            request_id: uuid::Uuid::new_v4(),
+            approved_env: &access.env,
+            scope: ApprovalScope::Session,
+            expires_at: None,
+            critical_confirmation: false,
+            created_at: Utc::now(),
+            signer_key_id: String::new(),
+            verified_context: None,
+        });
         assert!(sign_receipt("demo", Path::new(".env.vault"), payload).is_err());
 
         fs_util::ensure_private_dir(&run_dir()).unwrap();

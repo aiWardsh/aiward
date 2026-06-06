@@ -152,63 +152,47 @@ pub fn decrypt_session_signing_key(
     })
 }
 
-pub fn build_payload(
-    access: &AccessRequest,
-    grant_id: uuid::Uuid,
-    request_id: uuid::Uuid,
-    approved_env: &[String],
-    scope: ApprovalScope,
-    expires_at: Option<DateTime<Utc>>,
-    critical_confirmation: bool,
-    created_at: DateTime<Utc>,
-    signer_key_id: String,
-) -> ApprovalReceiptPayload {
-    build_payload_with_context(
-        access,
-        grant_id,
-        request_id,
-        approved_env,
-        scope,
-        expires_at,
-        critical_confirmation,
-        created_at,
-        signer_key_id,
-        None,
-    )
+pub struct PayloadBuildRequest<'a> {
+    pub access: &'a AccessRequest,
+    pub grant_id: uuid::Uuid,
+    pub request_id: uuid::Uuid,
+    pub approved_env: &'a [String],
+    pub scope: ApprovalScope,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub critical_confirmation: bool,
+    pub created_at: DateTime<Utc>,
+    pub signer_key_id: String,
+    pub verified_context: Option<&'a context::VerifiedContext>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn build_payload_with_context(
-    access: &AccessRequest,
-    grant_id: uuid::Uuid,
-    request_id: uuid::Uuid,
-    approved_env: &[String],
-    scope: ApprovalScope,
-    expires_at: Option<DateTime<Utc>>,
-    critical_confirmation: bool,
-    created_at: DateTime<Utc>,
-    signer_key_id: String,
-    verified_context: Option<&context::VerifiedContext>,
-) -> ApprovalReceiptPayload {
+pub fn build_payload(request: PayloadBuildRequest<'_>) -> ApprovalReceiptPayload {
     ApprovalReceiptPayload {
         schema_version: RECEIPT_SCHEMA_VERSION,
-        grant_id,
-        request_id,
-        project: access.project.clone(),
-        agent: access.agent.clone(),
-        branch: access.branch.clone(),
-        command_hash: command_hash(&access.command),
-        requested_env: sorted_strings(&access.env),
-        approved_env: sorted_strings(approved_env),
-        scope,
-        expires_at,
-        critical_confirmation,
-        created_at,
-        signer_key_id,
-        agent_key_id: verified_context.map(|context| context.agent_key_id.clone()),
-        verified_worktree: verified_context.map(|context| context.worktree.clone()),
-        verified_git_remote: verified_context.map(|context| context.git_remote.clone()),
-        verified_commit: verified_context.map(|context| context.commit.clone()),
+        grant_id: request.grant_id,
+        request_id: request.request_id,
+        project: request.access.project.clone(),
+        agent: request.access.agent.clone(),
+        branch: request.access.branch.clone(),
+        command_hash: command_hash(&request.access.command),
+        requested_env: sorted_strings(&request.access.env),
+        approved_env: sorted_strings(request.approved_env),
+        scope: request.scope,
+        expires_at: request.expires_at,
+        critical_confirmation: request.critical_confirmation,
+        created_at: request.created_at,
+        signer_key_id: request.signer_key_id,
+        agent_key_id: request
+            .verified_context
+            .map(|context| context.agent_key_id.clone()),
+        verified_worktree: request
+            .verified_context
+            .map(|context| context.worktree.clone()),
+        verified_git_remote: request
+            .verified_context
+            .map(|context| context.git_remote.clone()),
+        verified_commit: request
+            .verified_context
+            .map(|context| context.commit.clone()),
     }
 }
 
@@ -395,28 +379,32 @@ mod tests {
         let ciphertext = session_signing_key_ciphertext("demo", "1234", "session").unwrap();
         let session_key = decrypt_session_signing_key(&ciphertext, "session").unwrap();
         let now = Utc::now();
-        let first = build_payload(
-            &access(vec!["B_KEY", "A_KEY"]),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-            &["B_KEY".to_string(), "A_KEY".to_string()],
-            ApprovalScope::Always,
-            None,
-            false,
-            now,
-            session_key.signer_key_id.clone(),
-        );
-        let second = build_payload(
-            &access(vec!["A_KEY", "B_KEY"]),
-            uuid::Uuid::nil(),
-            uuid::Uuid::nil(),
-            &["A_KEY".to_string(), "B_KEY".to_string()],
-            ApprovalScope::Always,
-            None,
-            false,
-            now,
-            session_key.signer_key_id.clone(),
-        );
+        let first_access = access(vec!["B_KEY", "A_KEY"]);
+        let first = build_payload(PayloadBuildRequest {
+            access: &first_access,
+            grant_id: uuid::Uuid::nil(),
+            request_id: uuid::Uuid::nil(),
+            approved_env: &["B_KEY".to_string(), "A_KEY".to_string()],
+            scope: ApprovalScope::Always,
+            expires_at: None,
+            critical_confirmation: false,
+            created_at: now,
+            signer_key_id: session_key.signer_key_id.clone(),
+            verified_context: None,
+        });
+        let second_access = access(vec!["A_KEY", "B_KEY"]);
+        let second = build_payload(PayloadBuildRequest {
+            access: &second_access,
+            grant_id: uuid::Uuid::nil(),
+            request_id: uuid::Uuid::nil(),
+            approved_env: &["A_KEY".to_string(), "B_KEY".to_string()],
+            scope: ApprovalScope::Always,
+            expires_at: None,
+            critical_confirmation: false,
+            created_at: now,
+            signer_key_id: session_key.signer_key_id.clone(),
+            verified_context: None,
+        });
 
         assert_eq!(
             canonical_payload_bytes(&first),
@@ -434,17 +422,19 @@ mod tests {
         std::env::set_var("WARD_HOME", home.path());
         let ciphertext = session_signing_key_ciphertext("demo", "1234", "session").unwrap();
         let session_key = decrypt_session_signing_key(&ciphertext, "session").unwrap();
-        let payload = build_payload(
-            &access(vec!["DATABASE_URL"]),
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            &["DATABASE_URL".to_string()],
-            ApprovalScope::Always,
-            None,
-            false,
-            Utc::now(),
-            session_key.signer_key_id.clone(),
-        );
+        let access = access(vec!["DATABASE_URL"]);
+        let payload = build_payload(PayloadBuildRequest {
+            access: &access,
+            grant_id: uuid::Uuid::new_v4(),
+            request_id: uuid::Uuid::new_v4(),
+            approved_env: &["DATABASE_URL".to_string()],
+            scope: ApprovalScope::Always,
+            expires_at: None,
+            critical_confirmation: false,
+            created_at: Utc::now(),
+            signer_key_id: session_key.signer_key_id.clone(),
+            verified_context: None,
+        });
         let mut receipt = sign_payload(payload, &session_key).unwrap();
 
         assert!(verify_receipt_signature("demo", &receipt));
@@ -462,17 +452,19 @@ mod tests {
         std::env::set_var("WARD_HOME", home.path());
         let ciphertext = session_signing_key_ciphertext("demo", "1234", "session").unwrap();
         let session_key = decrypt_session_signing_key(&ciphertext, "session").unwrap();
-        let payload = build_payload(
-            &access(vec!["DATABASE_URL"]),
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            &["DATABASE_URL".to_string()],
-            ApprovalScope::Always,
-            None,
-            false,
-            Utc::now(),
-            session_key.signer_key_id.clone(),
-        );
+        let access = access(vec!["DATABASE_URL"]);
+        let payload = build_payload(PayloadBuildRequest {
+            access: &access,
+            grant_id: uuid::Uuid::new_v4(),
+            request_id: uuid::Uuid::new_v4(),
+            approved_env: &["DATABASE_URL".to_string()],
+            scope: ApprovalScope::Always,
+            expires_at: None,
+            critical_confirmation: false,
+            created_at: Utc::now(),
+            signer_key_id: session_key.signer_key_id.clone(),
+            verified_context: None,
+        });
         let receipt = sign_payload(payload.clone(), &session_key).unwrap();
 
         let mut mismatched_payload = payload;

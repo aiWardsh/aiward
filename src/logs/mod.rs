@@ -207,14 +207,13 @@ fn verify_log(kind: LogKind, decrypt_payloads: bool) -> Result<LogVerification> 
     let path = log_path(kind);
     let entries = read_entries(&path)?;
     let mut previous_hash = GENESIS_HASH.to_string();
-    let mut expected_sequence = 1_u64;
     let key = if decrypt_payloads {
         Some(log_key()?)
     } else {
         None
     };
 
-    for entry in &entries {
+    for (expected_sequence, entry) in (1_u64..).zip(entries.iter()) {
         if entry.kind != kind {
             anyhow::bail!(
                 "{} contains an entry for a different log kind",
@@ -238,7 +237,6 @@ fn verify_log(kind: LogKind, decrypt_payloads: bool) -> Result<LogVerification> 
             decrypt_entry(entry, key)?;
         }
         previous_hash = entry.entry_hash.clone();
-        expected_sequence += 1;
     }
 
     Ok(LogVerification {

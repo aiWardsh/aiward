@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::vault;
 
+type OutputEmitter = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub struct MissingVaultEnvError {
     missing: Vec<String>,
@@ -99,7 +101,7 @@ pub fn run_command(request: RunCommandRequest) -> Result<RunCommandOutcome> {
 
 pub fn run_command_with_emitter(
     request: RunCommandRequest,
-    emitter: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    emitter: OutputEmitter,
 ) -> Result<RunCommandOutcome> {
     if request.command.is_empty() {
         anyhow::bail!("no command was provided");
