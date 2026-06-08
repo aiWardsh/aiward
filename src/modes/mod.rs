@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -58,6 +58,10 @@ pub fn load_local_modes(project_root: &Path) -> Result<Vec<ModeConfig>> {
     if !path.exists() {
         return Ok(vec![]);
     }
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path.components().any(|c| c == Component::ParentDir) {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let content =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let modes: Vec<ModeConfig> =
@@ -84,6 +88,10 @@ pub fn push_modes(
 
     // Store checksum of the local file for drift detection
     if local_path.exists() {
+        // Prevent path traversal attacks by rejecting paths containing '..'.
+        if local_path.components().any(|c| c == Component::ParentDir) {
+            anyhow::bail!("Invalid input: {}", local_path.display());
+        }
         let content = fs::read(local_path)?;
         let checksum = hex::encode(Sha256::digest(&content));
         fs::write(broker_modes_checksum_path(project), checksum)?;
@@ -96,6 +104,10 @@ pub fn load_broker_modes(project: &str, passphrase: &str) -> Result<Vec<ModeConf
     let vault_path = broker_modes_vault_path(project);
     if !vault_path.exists() {
         return Ok(vec![]);
+    }
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if vault_path.components().any(|c| c == Component::ParentDir) {
+        anyhow::bail!("Invalid input: {}", vault_path.display());
     }
     let vault_json = fs::read_to_string(&vault_path)
         .with_context(|| format!("failed to read {}", vault_path.display()))?;

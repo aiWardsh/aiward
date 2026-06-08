@@ -277,6 +277,13 @@ pub fn canonical_payload_bytes(payload: &ApprovalReceiptPayload) -> Vec<u8> {
 
 fn read_project_key(project: &str) -> Result<ApprovalKeyFile> {
     let path = project_key_path(project);
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let key_file = serde_json::from_str::<ApprovalKeyFile>(&contents)

@@ -280,6 +280,13 @@ pub fn consume_once_grant(id: uuid::Uuid) -> Result<bool> {
 }
 
 pub fn load_grants_from_path(path: &Path) -> Result<Vec<ApprovalGrant>> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -370,6 +377,13 @@ pub fn prune_expired_grants_at_path(path: &Path, now: DateTime<Utc>) -> Result<u
 }
 
 fn write_grants_to_path(path: &Path, grants: &[ApprovalGrant]) -> Result<()> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     ensure_ward_home_for(path)?;
     fs_util::ensure_private_parent_dir(path)?;
     let mut file = fs::File::create(path).context(format!("failed to write {}", path.display()))?;

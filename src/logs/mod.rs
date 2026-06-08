@@ -289,6 +289,13 @@ fn last_entry(path: &Path) -> Result<Option<EncryptedLogEntry>> {
 }
 
 fn read_entries(path: &Path) -> Result<Vec<EncryptedLogEntry>> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     if !path.exists() {
         return Ok(Vec::new());
     }

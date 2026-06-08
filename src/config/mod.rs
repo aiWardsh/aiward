@@ -199,6 +199,13 @@ pub fn config_backup_path(project: &str) -> PathBuf {
 
 pub fn read_project_config_backup(project: &str) -> Result<ProjectConfigBackup> {
     let path = config_backup_path(project);
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let contents =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
@@ -381,6 +388,13 @@ pub fn replace_default_profiles(config: &mut ProjectConfig, env_keys: &[String],
 
 pub fn ensure_gitignore(cwd: &Path, commit_vault: bool) -> Result<PathBuf> {
     let path = cwd.join(".gitignore");
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let existing = if path.exists() {
         fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?
     } else {
@@ -438,6 +452,13 @@ pub fn ensure_agent_instructions(cwd: &Path, project: &str) -> Result<Option<Pat
     } else {
         cwd.join(AGENT_INSTRUCTIONS_FILE)
     };
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let section = agent_instructions_section(project);
 
     if path.exists() {
