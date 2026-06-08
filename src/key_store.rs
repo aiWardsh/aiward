@@ -83,11 +83,15 @@ fn use_keychain_store() -> bool {
 }
 
 fn file_store_path() -> PathBuf {
-    logs::ward_home().join("cache").join("keystore.json")
+    let relative = PathBuf::from("cache").join("keystore.json");
+    fs_util::resolve_ward_home_path(&relative, "file keystore path")
+        .expect("file keystore path should stay inside Ward home")
 }
 
 fn legacy_file_store_path() -> PathBuf {
-    logs::ward_home().join("cache").join("test-keyring.json")
+    let relative = PathBuf::from("cache").join("test-keyring.json");
+    fs_util::resolve_ward_home_path(&relative, "legacy file keystore path")
+        .expect("legacy file keystore path should stay inside Ward home")
 }
 
 fn set_file_secret(name: &str, secret: &str) -> Result<()> {

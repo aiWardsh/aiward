@@ -39,7 +39,8 @@ pub struct AgentProof {
 }
 
 pub fn agents_path() -> PathBuf {
-    logs::ward_home().join("agents.json")
+    fs_util::resolve_ward_home_path(std::path::Path::new("agents.json"), "agents path")
+        .expect("agents path should stay inside Ward home")
 }
 
 pub fn ensure_agent(project: &str, agent_name: &str) -> Result<AgentIdentity> {

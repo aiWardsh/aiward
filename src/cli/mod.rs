@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     agents, anomaly,
     approvals::{self, ApprovalChannel, ApprovalDecision, ApprovalScope},
-    broker, config, context, detection, env_file, git_context, grants,
+    broker, config, context, detection, env_file, fs_util, git_context, grants,
     logs::{self as audit_logs, self as logs, LogKind},
     modes, notifications, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
@@ -1486,12 +1486,9 @@ fn setup(options: SetupOptions) -> Result<()> {
 
     let commit_vault = !options.ignore_vault;
     let remove_plaintext = options.remove_plaintext && !options.keep_plaintext;
-    let source_exists = options.source.exists();
-    let configured_vault_path = if options.vault.is_absolute() {
-        options.vault.clone()
-    } else {
-        cwd.join(&options.vault)
-    };
+    let source_path = fs_util::resolve_project_path(&cwd, &options.source, "setup source")?;
+    let configured_vault_path = fs_util::resolve_project_path(&cwd, &options.vault, "setup vault")?;
+    let source_exists = source_path.exists();
     let registered_vault_path = config::read_project_config(&cwd)
         .ok()
         .and_then(|existing| registry::resolve_project(Some(&existing.project), &cwd).ok())
@@ -1503,13 +1500,13 @@ fn setup(options: SetupOptions) -> Result<()> {
         .filter(|path| path.exists());
     let vault_path = registered_vault_path.unwrap_or(configured_vault_path);
     let source_is_locked = if source_exists {
-        env_file::is_locked_env_file(&options.source)?
+        env_file::is_locked_env_file(&source_path)?
     } else {
         false
     };
 
     let env_keys = if source_exists && !source_is_locked {
-        config::env_keys_from_dotenv_file(&options.source)?
+        config::env_keys_from_dotenv_file(&source_path)?
     } else if let Ok(existing) = config::read_project_config(&cwd) {
         let mut keys = std::collections::BTreeSet::new();
         for profile in existing.profiles.values() {
@@ -1555,31 +1552,31 @@ fn setup(options: SetupOptions) -> Result<()> {
             if !vault_path.exists() {
                 anyhow::bail!(
                     "{} is an Ward locked marker but {} is missing; restore a plaintext dotenv file or the vault before setup",
-                    options.source.display(),
+                    source_path.display(),
                     vault_path.display()
                 );
             }
-            env_file::lock_env_file(&options.source, &vault_path)?;
+            env_file::lock_env_file(&source_path, &vault_path)?;
             locked_env = true;
             term::ok_detail("locked marker", "refreshed");
         } else {
             let passphrase = vault::read_new_passphrase()?;
             term::blank();
             let sp = term::spinner("Encrypting local env");
-            vault::import_env_file(&options.source, &vault_path, &passphrase)?;
+            vault::import_env_file(&source_path, &vault_path, &passphrase)?;
             let plaintext = vault::decrypt_vault_file(&vault_path, &passphrase)?;
             verified_env_keys = Some(config::env_keys_from_dotenv_str(&plaintext)?);
             recovery_plaintext = Some(plaintext);
             setup_passphrase = Some(passphrase);
             imported = true;
             if !options.keep_plaintext && !remove_plaintext {
-                env_file::lock_env_file(&options.source, &vault_path)?;
+                env_file::lock_env_file(&source_path, &vault_path)?;
                 locked_env = true;
             }
             term::done_detail(
                 sp,
                 "vault encrypted",
-                &format!("{} -> {}", options.source.display(), vault_path.display()),
+                &format!("{} -> {}", source_path.display(), vault_path.display()),
             );
         }
     } else if !vault_path.exists() {
@@ -1589,7 +1586,7 @@ fn setup(options: SetupOptions) -> Result<()> {
         let envelope = vault::encrypt_env("", &passphrase)?;
         vault::write_vault(&vault_path, &envelope)?;
         vault::decrypt_vault_file(&vault_path, &passphrase)?;
-        env_file::lock_env_file(&options.source, &vault_path)?;
+        env_file::lock_env_file(&source_path, &vault_path)?;
         verified_env_keys = Some(Vec::new());
         recovery_plaintext = Some(String::new());
         setup_passphrase = Some(passphrase);
@@ -1599,7 +1596,7 @@ fn setup(options: SetupOptions) -> Result<()> {
         term::ok_detail("vault encrypted", &term::short_path(&vault_path));
     }
     if locked_env && !source_is_locked {
-        term::ok_detail("locked marker", &options.source.display().to_string());
+        term::ok_detail("locked marker", &source_path.display().to_string());
     }
 
     if let Some(env_keys) = verified_env_keys.as_deref() {
@@ -1627,8 +1624,8 @@ fn setup(options: SetupOptions) -> Result<()> {
 
     let mut removed_plaintext = false;
     if source_exists && !source_is_locked && remove_plaintext {
-        fs::remove_file(&options.source)
-            .context(format!("failed to remove {}", options.source.display()))?;
+        fs::remove_file(&source_path)
+            .context(format!("failed to remove {}", source_path.display()))?;
         removed_plaintext = true;
     }
 
@@ -1696,7 +1693,7 @@ fn setup(options: SetupOptions) -> Result<()> {
     let event = SetupEvent {
         event_type: "setup.completed",
         project: &project_config.project,
-        source: &options.source,
+        source: &source_path,
         vault: &vault_path,
         imported,
         removed_plaintext,
@@ -1851,24 +1848,22 @@ fn init_bare(project: Option<String>, force: bool) -> Result<()> {
 
 fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
     let cwd = env::current_dir()?;
+    let source_path = fs_util::resolve_project_path(&cwd, &source, "import source")?;
     let mut config =
         config::read_project_config(&cwd).context("missing .ward.json; run ward init first")?;
-    if env_file::is_locked_env_file(&source)? {
+    if env_file::is_locked_env_file(&source_path)? {
         anyhow::bail!(
             "{} is already an Ward locked marker; use ward env unlock to restore plaintext before importing",
-            source.display()
+            source_path.display()
         );
     }
     let passphrase = vault::read_new_passphrase()?;
     let vault_path = match explicit_vault {
         Some(vault) => {
+            let resolved_vault = fs_util::resolve_project_path(&cwd, &vault, "import vault")?;
             config.vault = vault.clone();
             config::write_project_config(&cwd, &config, true)?;
-            if vault.is_absolute() {
-                vault
-            } else {
-                cwd.join(vault)
-            }
+            resolved_vault
         }
         None => registry::resolve_project(Some(&config.project), &cwd)
             .ok()
@@ -1879,9 +1874,9 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
             }),
     };
 
-    let written = vault::import_env_file(&source, &vault_path, &passphrase)?;
+    let written = vault::import_env_file(&source_path, &vault_path, &passphrase)?;
     vault::decrypt_vault_file(&written, &passphrase)?;
-    env_file::lock_env_file(&source, &written)?;
+    env_file::lock_env_file(&source_path, &written)?;
     registry::update_project_vault(&config.project, cwd.clone(), written.clone())?;
     let resolved = registry::ResolvedProject {
         name: config.project.clone(),
@@ -1895,7 +1890,7 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
     let event = VaultImportEvent {
         event_type: "vault.import",
         project: &config.project,
-        source: &source,
+        source: &source_path,
         vault: &written,
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
@@ -1907,7 +1902,7 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
         mode: None,
     });
     term::ok_detail("vault encrypted", &term::short_path(&written));
-    term::ok_detail("locked marker", &source.display().to_string());
+    term::ok_detail("locked marker", &source_path.display().to_string());
     Ok(())
 }
 
@@ -3002,7 +2997,8 @@ fn env_command(command: EnvCommand) -> Result<()> {
             let targets = resolve_env_targets_with_passphrase(project, app, all, &passphrase)?;
             for target in targets {
                 let resolved = target.resolved_project();
-                let output = project_relative_path(&resolved.path, output.clone());
+                let output =
+                    project_relative_path(&resolved.path, output.clone(), "env unlock output")?;
                 with_passphrase_vault_access(&resolved, &passphrase, || {
                     env_file::unlock_env_file(&output, &resolved.vault, &passphrase, force)
                 })?;
@@ -3024,7 +3020,7 @@ fn env_command(command: EnvCommand) -> Result<()> {
         } => {
             let passphrase = vault::read_existing_passphrase()?;
             let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
-            let source = project_relative_path(&resolved.path, source);
+            let source = project_relative_path(&resolved.path, source, "env lock source")?;
             with_passphrase_vault_access(&resolved, &passphrase, || {
                 env_file::lock_plaintext_source(&source, &resolved.vault, &passphrase)?;
                 warn_store_refresh_failure(refresh_project_store_with_passphrase(
@@ -3065,7 +3061,8 @@ fn env_command(command: EnvCommand) -> Result<()> {
                     Some(path) => path,
                     None => ".env.export".into(),
                 };
-                let output = project_relative_path(&resolved.path, output_path);
+                let output =
+                    project_relative_path(&resolved.path, output_path, "env export output")?;
                 with_passphrase_vault_access(&resolved, &passphrase, || {
                     env_file::export_env_file(&output, &resolved.vault, &passphrase, force)
                 })?;
@@ -3229,12 +3226,8 @@ fn print_env_request_set_response(
     Ok(())
 }
 
-fn project_relative_path(project_path: &Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        path
-    } else {
-        project_path.join(path)
-    }
+fn project_relative_path(project_path: &Path, path: PathBuf, label: &str) -> Result<PathBuf> {
+    fs_util::resolve_project_path(project_path, &path, label)
 }
 
 fn log_env_file_event(
@@ -3295,7 +3288,8 @@ fn with_passphrase_vault_access<T>(
 }
 
 fn vault_file_fingerprint(vault: &Path) -> Result<String> {
-    let bytes = fs::read(vault).with_context(|| format!("failed to read {}", vault.display()))?;
+    let vault = fs_util::resolve_existing_external_file(vault, "vault fingerprint")?;
+    let bytes = fs::read(&vault).with_context(|| format!("failed to read {}", vault.display()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
@@ -7936,7 +7930,7 @@ mod tests {
         policy::{AccessRequest, ApprovalMode, PolicyEvaluation},
         project_teardown::{
             remove_agent_instruction_section, remove_locked_env_if_needed,
-            remove_project_file_if_exists,
+            remove_project_file_if_exists, ProjectTeardownRequest,
         },
     };
     use clap::CommandFactory;
@@ -8625,6 +8619,77 @@ mod tests {
         std::env::remove_var("WARD_HOME");
         std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
         std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn setup_rejects_project_path_traversal_inputs() {
+        let _guard = cwd_lock();
+        let old_cwd = std::env::current_dir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(project.path()).unwrap();
+
+        let bad_vault = setup(SetupOptions {
+            yes: true,
+            project: Some("demo".to_string()),
+            source: ".env".into(),
+            vault: "../outside.vault".into(),
+            commit_vault: false,
+            ignore_vault: false,
+            remove_plaintext: false,
+            keep_plaintext: false,
+            unlock_ttl: "8h".to_string(),
+            no_unlock: true,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(bad_vault.contains("parent directory traversal"));
+
+        let bad_source = setup(SetupOptions {
+            yes: true,
+            project: Some("demo".to_string()),
+            source: "../outside.env".into(),
+            vault: ".env.vault".into(),
+            commit_vault: false,
+            ignore_vault: false,
+            remove_plaintext: false,
+            keep_plaintext: false,
+            unlock_ttl: "8h".to_string(),
+            no_unlock: true,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(bad_source.contains("parent directory traversal"));
+
+        std::env::set_current_dir(old_cwd).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn import_and_teardown_reject_project_path_traversal_inputs() {
+        let _guard = cwd_lock();
+        let old_cwd = std::env::current_dir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(project.path()).unwrap();
+
+        let import_error = import("../outside.env".into(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(import_error.contains("parent directory traversal"));
+
+        let teardown_error = crate::project_teardown::teardown_project(ProjectTeardownRequest {
+            project: "demo".to_string(),
+            path: project.path().to_path_buf(),
+            vault: project.path().join(".env.vault"),
+            export_path: "../export.env".into(),
+            restore_env: false,
+            decrypt_key: "unused".to_string(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(teardown_error.contains("parent directory traversal"));
+
+        std::env::set_current_dir(old_cwd).unwrap();
     }
 
     #[test]

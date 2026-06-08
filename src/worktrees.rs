@@ -59,7 +59,8 @@ pub enum WorktreeDecision {
 }
 
 pub fn worktrees_path() -> PathBuf {
-    logs::ward_home().join("worktrees.json")
+    fs_util::resolve_ward_home_path(Path::new("worktrees.json"), "worktrees path")
+        .expect("worktrees path should stay inside Ward home")
 }
 
 pub fn load_state() -> Result<WorktreeState> {

@@ -11,7 +11,7 @@ use zeroize::Zeroize;
 
 use crate::{
     approvals::ApprovalScope,
-    context, fs_util, logs,
+    context, fs_util,
     policy::AccessRequest,
     vault::{self, VaultEnvelope},
 };
@@ -88,11 +88,14 @@ impl Drop for SessionSigningKey {
 }
 
 pub fn keys_dir() -> PathBuf {
-    logs::ward_home().join("keys")
+    fs_util::resolve_ward_home_path(std::path::Path::new("keys"), "approval keys directory")
+        .expect("approval keys directory should stay inside Ward home")
 }
 
 pub fn project_key_path(project: &str) -> PathBuf {
-    keys_dir().join(format!("{}.json", project_path_id(project)))
+    let relative = PathBuf::from("keys").join(format!("{}.json", project_path_id(project)));
+    fs_util::resolve_ward_home_path(&relative, "approval key path")
+        .expect("approval key path should stay inside Ward home")
 }
 
 pub fn ensure_project_key(project: &str, passphrase: &str) -> Result<ApprovalKeyFile> {

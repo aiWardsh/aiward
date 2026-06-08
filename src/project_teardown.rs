@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config, env_file, grants, logs, pending_requests, project_store, registry, unlock, vault,
-    worktrees,
+    config, env_file, fs_util, grants, logs, pending_requests, project_store, registry, unlock,
+    vault, worktrees,
 };
 
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ pub fn teardown_project(request: ProjectTeardownRequest) -> Result<ProjectTeardo
     } else {
         request.export_path
     };
-    let output = project_relative_path(&request.path, export_path);
+    let output = project_relative_path(&request.path, export_path)?;
     if output == request.path.join(".env") && !request.restore_env {
         anyhow::bail!("restoring plaintext .env requires --restore-env");
     }
@@ -119,12 +119,8 @@ pub fn teardown_project(request: ProjectTeardownRequest) -> Result<ProjectTeardo
     Ok(outcome)
 }
 
-fn project_relative_path(project_path: &Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        path
-    } else {
-        project_path.join(path)
-    }
+fn project_relative_path(project_path: &Path, path: PathBuf) -> Result<PathBuf> {
+    fs_util::resolve_project_path(project_path, &path, "teardown export path")
 }
 
 pub(crate) fn remove_locked_env_if_needed(

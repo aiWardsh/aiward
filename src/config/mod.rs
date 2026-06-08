@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{approvals::ApprovalScope, fs_util, logs, policy::ApprovalMode, vault};
+use crate::{approvals::ApprovalScope, fs_util, policy::ApprovalMode, vault};
 
 pub const PROJECT_CONFIG_FILE: &str = ".ward.json";
 pub const WARD_JSON_GITIGNORE_ENTRY: &str = ".ward.json";
@@ -165,6 +165,7 @@ pub fn read_project_config(cwd: &Path) -> Result<ProjectConfig> {
     if config.vault_nonce.is_empty() {
         config.vault_nonce = vault::generate_vault_nonce();
     }
+    validate_project_config_paths(cwd, &config)?;
     Ok(config)
 }
 
@@ -177,6 +178,7 @@ pub fn write_project_config(cwd: &Path, config: &ProjectConfig, force: bool) -> 
         );
     }
 
+    validate_project_config_paths(cwd, config)?;
     let contents = serde_json::to_string_pretty(config)?;
     fs::write(&path, format!("{contents}\n"))
         .context(format!("failed to write {}", path.display()))?;
@@ -185,11 +187,14 @@ pub fn write_project_config(cwd: &Path, config: &ProjectConfig, force: bool) -> 
 }
 
 pub fn config_backups_dir() -> PathBuf {
-    logs::ward_home().join(CONFIG_BACKUP_DIR)
+    fs_util::resolve_ward_home_path(Path::new(CONFIG_BACKUP_DIR), "config backup directory")
+        .expect("config backup directory should stay inside Ward home")
 }
 
 pub fn config_backup_path(project: &str) -> PathBuf {
-    config_backups_dir().join(format!("{}.json", slugify(project)))
+    let relative = PathBuf::from(CONFIG_BACKUP_DIR).join(format!("{}.json", slugify(project)));
+    fs_util::resolve_ward_home_path(&relative, "config backup path")
+        .expect("config backup path should stay inside Ward home")
 }
 
 pub fn read_project_config_backup(project: &str) -> Result<ProjectConfigBackup> {
@@ -643,11 +648,12 @@ and wait, but approval authority belongs to the broker and human approval paths.
 }
 
 pub fn resolve_vault_path(cwd: &Path, config: &ProjectConfig) -> PathBuf {
-    if config.vault.is_absolute() {
-        config.vault.clone()
-    } else {
-        cwd.join(&config.vault)
-    }
+    resolve_vault_path_checked(cwd, config)
+        .expect("project config vault path should be validated before resolving")
+}
+
+pub fn resolve_vault_path_checked(cwd: &Path, config: &ProjectConfig) -> Result<PathBuf> {
+    fs_util::resolve_project_path(cwd, &config.vault, "vault path")
 }
 
 /// Derives the vault path from passphrase + project + nonce when dynamic naming is active.
@@ -657,7 +663,8 @@ pub fn resolve_vault_path_dynamic(cwd: &Path, config: &ProjectConfig, passphrase
         return resolve_vault_path(cwd, config);
     }
     let filename = vault::derive_vault_filename(passphrase, &config.project, &config.vault_nonce);
-    cwd.join(filename)
+    fs_util::resolve_project_path(cwd, Path::new(&filename), "derived vault path")
+        .expect("derived vault filename should stay inside the project")
 }
 
 /// Resolves the current vault path when a passphrase is available.
@@ -687,6 +694,11 @@ fn default_anomaly_detection() -> AnomalyDetectionConfig {
         max_runs_per_hour_per_grant: 20,
         max_branches_per_grant: 3,
     }
+}
+
+fn validate_project_config_paths(cwd: &Path, config: &ProjectConfig) -> Result<()> {
+    resolve_vault_path_checked(cwd, config)?;
+    Ok(())
 }
 
 fn default_env_keys() -> Vec<String> {
@@ -996,6 +1008,41 @@ mod tests {
 
         config.vault = tempdir.path().join("custom.vault");
         assert_eq!(resolve_vault_path(tempdir.path(), &config), config.vault);
+    }
+
+    #[test]
+    fn project_config_rejects_vault_path_traversal() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut config =
+            ProjectConfig::default_for_dir(tempdir.path(), Some("demo".to_string())).unwrap();
+        config.vault = PathBuf::from("../outside.vault");
+
+        let error = write_project_config(tempdir.path(), &config, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("parent directory traversal"));
+
+        std::fs::write(
+            config_path(tempdir.path()),
+            r#"{"version":1,"project":"demo","vault":"../outside.vault","profiles":{}}"#,
+        )
+        .unwrap();
+        let error = read_project_config(tempdir.path()).unwrap_err().to_string();
+        assert!(error.contains("parent directory traversal"));
+    }
+
+    #[test]
+    fn project_config_rejects_absolute_vault_path_outside_project() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut config =
+            ProjectConfig::default_for_dir(tempdir.path(), Some("demo".to_string())).unwrap();
+        config.vault = outside.path().join("outside.vault");
+
+        let error = write_project_config(tempdir.path(), &config, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must stay inside"));
     }
 
     #[test]

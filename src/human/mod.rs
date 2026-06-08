@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{broker, fs_util, logs, term, workspace_target};
+use crate::{broker, fs_util, term, workspace_target};
 use base64::Engine as _;
 
 const HUMAN_ACTIVATION_BODY: &str =
@@ -22,9 +22,9 @@ const HUMAN_ACTIVE_BODY: &str =
 // ── Path helpers ─────────────────────────────────────────────────────────────
 
 pub fn human_run_dir(shell_pid: u32) -> PathBuf {
-    logs::ward_home()
-        .join("run")
-        .join(format!("human-{shell_pid}"))
+    let relative = PathBuf::from("run").join(format!("human-{shell_pid}"));
+    fs_util::resolve_ward_home_path(&relative, "human run directory")
+        .expect("human run directory should stay inside Ward home")
 }
 
 pub fn guardian_socket_path(shell_pid: u32) -> PathBuf {
@@ -539,7 +539,7 @@ fn stale_guardian_processes() -> Vec<GuardianProcess> {
 }
 
 fn stale_human_run_dirs() -> Vec<PathBuf> {
-    let run_dir = logs::ward_home().join("run");
+    let run_dir = broker::run_dir();
     let Ok(entries) = std::fs::read_dir(run_dir) else {
         return Vec::new();
     };

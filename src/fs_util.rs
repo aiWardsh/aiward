@@ -1,9 +1,167 @@
 use std::{
     fs::{self, File, OpenOptions},
-    path::Path,
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
+
+pub(crate) fn resolve_inside_base(base: &Path, candidate: &Path, label: &str) -> Result<PathBuf> {
+    if has_parent_component(candidate) {
+        anyhow::bail!("{label} must not contain parent directory traversal");
+    }
+
+    let base_abs = absolutize(base)?;
+    let base_norm = normalize_lexical(&base_abs);
+    let candidate_abs = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base_norm.join(candidate)
+    };
+    let candidate_norm = normalize_lexical(&candidate_abs);
+
+    if !candidate_norm.starts_with(&base_norm) {
+        anyhow::bail!(
+            "{label} must stay inside {}; got {}",
+            base_norm.display(),
+            candidate.display()
+        );
+    }
+
+    let base_real = base_norm
+        .canonicalize()
+        .unwrap_or_else(|_| base_norm.clone());
+    let check_path = nearest_existing_path(&candidate_norm);
+    if let Ok(real_path) = check_path.canonicalize() {
+        if !real_path.starts_with(&base_real) {
+            anyhow::bail!(
+                "{label} must stay inside {}; got {}",
+                base_real.display(),
+                candidate.display()
+            );
+        }
+    }
+
+    Ok(candidate_norm)
+}
+
+pub(crate) fn resolve_project_path(
+    project_root: &Path,
+    candidate: &Path,
+    label: &str,
+) -> Result<PathBuf> {
+    resolve_inside_base(project_root, candidate, label)
+}
+
+pub(crate) fn resolve_ward_home_path(candidate: &Path, label: &str) -> Result<PathBuf> {
+    resolve_inside_base(&ward_home_base(), candidate, label)
+}
+
+pub(crate) fn resolve_existing_external_file(path: &Path, label: &str) -> Result<PathBuf> {
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("{label} not found: {}", path.display()))?;
+    if !resolved.is_file() {
+        anyhow::bail!("{label} is not a file: {}", resolved.display());
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn resolve_existing_external_dir(path: &Path, label: &str) -> Result<PathBuf> {
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("{label} not found: {}", path.display()))?;
+    if !resolved.is_dir() {
+        anyhow::bail!("{label} is not a directory: {}", resolved.display());
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn resolve_external_output(path: &Path, label: &str) -> Result<PathBuf> {
+    if has_parent_component(path) {
+        anyhow::bail!("{label} must not contain parent directory traversal");
+    }
+    let resolved = absolutize(path)?;
+    if let Some(parent) = resolved.parent() {
+        let parent_real = parent
+            .canonicalize()
+            .with_context(|| format!("failed to resolve parent for {}", path.display()))?;
+        Ok(parent_real.join(
+            resolved
+                .file_name()
+                .context("output path must include a file name")?,
+        ))
+    } else {
+        Ok(resolved)
+    }
+}
+
+pub(crate) fn resolve_external_directory_output(path: &Path, label: &str) -> Result<PathBuf> {
+    if has_parent_component(path) {
+        anyhow::bail!("{label} must not contain parent directory traversal");
+    }
+    let resolved = absolutize(path)?;
+    let existing = nearest_existing_path(&resolved);
+    if let Ok(existing_real) = existing.canonicalize() {
+        if let Ok(suffix) = resolved.strip_prefix(&existing) {
+            return Ok(existing_real.join(suffix));
+        }
+    }
+    Ok(resolved)
+}
+
+fn has_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn absolutize(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(path))
+    }
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn nearest_existing_path(path: &Path) -> PathBuf {
+    let mut current = path;
+    loop {
+        if current.exists() {
+            return current.to_path_buf();
+        }
+        let Some(parent) = current.parent() else {
+            return path.to_path_buf();
+        };
+        current = parent;
+    }
+}
+
+fn ward_home_base() -> PathBuf {
+    match std::env::var("WARD_HOME")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+    {
+        Some(path) => PathBuf::from(path),
+        None => dirs::home_dir().unwrap_or(PathBuf::from(".")).join(".ward"),
+    }
+}
 
 pub(crate) fn ensure_parent_dir(path: &Path) -> Result<()> {
     match path
@@ -129,5 +287,55 @@ mod tests {
         assert!(ensure_private_dir(&blocked).is_err());
         assert!(write_private_file(&blocked, b"contents").is_ok());
         assert!(open_private_append(&blocked).is_ok());
+    }
+
+    #[test]
+    fn resolve_inside_base_rejects_parent_traversal_and_absolute_escape() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let parent_error =
+            resolve_inside_base(base.path(), Path::new("../outside.vault"), "vault path")
+                .unwrap_err()
+                .to_string();
+        assert!(parent_error.contains("parent directory traversal"));
+
+        let absolute_error = resolve_inside_base(
+            base.path(),
+            &outside.path().join("outside.vault"),
+            "vault path",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(absolute_error.contains("must stay inside"));
+    }
+
+    #[test]
+    fn resolve_inside_base_accepts_relative_and_absolute_inside_base() {
+        let base = tempfile::tempdir().unwrap();
+        let nested = base.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let relative =
+            resolve_inside_base(base.path(), Path::new("nested/.env.vault"), "vault").unwrap();
+        let absolute =
+            resolve_inside_base(base.path(), &nested.join(".env.vault"), "vault").unwrap();
+
+        assert_eq!(relative, nested.join(".env.vault"));
+        assert_eq!(absolute, nested.join(".env.vault"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_inside_base_rejects_symlink_escape() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let error = resolve_inside_base(base.path(), Path::new("link/secret.env"), "vault path")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("must stay inside"));
     }
 }

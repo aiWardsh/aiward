@@ -27,7 +27,7 @@ use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
     approvals::{ApprovalChannel, ApprovalDecision, ApprovalScope, ApprovalSource},
-    config, detection, env_file, fs_util, grants, logs, modes, pending_requests,
+    config, detection, env_file, fs_util, grants, modes, pending_requests,
     policy::{self, AccessRequest},
     project_store, project_teardown, recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
@@ -477,7 +477,8 @@ struct BrokerSession {
 }
 
 pub fn run_dir() -> PathBuf {
-    logs::ward_home().join("run")
+    fs_util::resolve_ward_home_path(Path::new("run"), "broker run directory")
+        .expect("broker run directory should stay inside Ward home")
 }
 
 pub fn socket_path() -> PathBuf {
@@ -2013,15 +2014,7 @@ pub(crate) fn setup_project_with_passphrase(
     project: Option<&str>,
     passphrase: &str,
 ) -> Result<BrokerProjectSetupStatus> {
-    let target_path = target_path
-        .canonicalize()
-        .unwrap_or_else(|_| target_path.to_path_buf());
-    if !target_path.is_dir() {
-        anyhow::bail!(
-            "selected path is not a directory: {}",
-            target_path.display()
-        );
-    }
+    let target_path = fs_util::resolve_existing_external_dir(target_path, "selected project path")?;
 
     if let Ok(config) = config::read_project_config(&target_path) {
         let project_name = project.unwrap_or(&config.project).to_string();
@@ -2121,8 +2114,10 @@ pub(crate) fn setup_project_with_passphrase(
 }
 
 fn prepare_provision_target(target_path: &Path) -> Result<PathBuf> {
+    let target_path =
+        fs_util::resolve_external_directory_output(target_path, "project target path")?;
     if !target_path.exists() {
-        fs::create_dir_all(target_path)
+        fs::create_dir_all(&target_path)
             .with_context(|| format!("failed to create {}", target_path.display()))?;
     }
     let target_path = target_path
@@ -3013,7 +3008,8 @@ fn session_workspace_metadata(project: &str) -> (Option<PathBuf>, Option<String>
 }
 
 fn vault_fingerprint(vault: &Path) -> Result<String> {
-    let bytes = fs::read(vault).with_context(|| format!("failed to read {}", vault.display()))?;
+    let vault = fs_util::resolve_existing_external_file(vault, "vault fingerprint")?;
+    let bytes = fs::read(&vault).with_context(|| format!("failed to read {}", vault.display()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 

@@ -69,7 +69,9 @@ struct UnlockState {
 }
 
 pub fn unlocks_path() -> PathBuf {
-    logs::ward_home().join("sessions").join("unlocks.json")
+    let relative = PathBuf::from("sessions").join("unlocks.json");
+    fs_util::resolve_ward_home_path(&relative, "unlock metadata path")
+        .expect("unlock metadata path should stay inside Ward home")
 }
 
 pub fn parse_ttl(value: &str) -> Result<Duration> {

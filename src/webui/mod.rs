@@ -1849,11 +1849,17 @@ fn port_accepts_connections(port: u16) -> bool {
 }
 
 fn metadata_dir() -> PathBuf {
-    logs::ward_home().join("run").join("dashboard")
+    let relative = PathBuf::from("run").join("dashboard");
+    fs_util::resolve_ward_home_path(&relative, "dashboard metadata directory")
+        .expect("dashboard metadata directory should stay inside Ward home")
 }
 
 fn metadata_path(pid: u32) -> PathBuf {
-    metadata_dir().join(format!("{pid}.json"))
+    let relative = PathBuf::from("run")
+        .join("dashboard")
+        .join(format!("{pid}.json"));
+    fs_util::resolve_ward_home_path(&relative, "dashboard metadata path")
+        .expect("dashboard metadata path should stay inside Ward home")
 }
 
 fn write_instance(instance: &DashboardInstance) -> Result<()> {

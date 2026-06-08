@@ -37,7 +37,12 @@ pub struct ActiveMode {
 }
 
 pub fn local_modes_path(project_root: &Path) -> PathBuf {
-    project_root.join(".ward.modes.json")
+    fs_util::resolve_project_path(
+        project_root,
+        Path::new(".ward.modes.json"),
+        "local modes path",
+    )
+    .expect("local modes path should stay inside the project")
 }
 
 pub fn broker_modes_vault_path(project: &str) -> PathBuf {

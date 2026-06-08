@@ -141,7 +141,8 @@ pub fn restore_material_from_file(
     path: &Path,
     recovery_passphrase: &str,
 ) -> Result<RecoveryMaterial> {
-    material_from_recovery_file(project, path, recovery_passphrase)
+    let path = fs_util::resolve_existing_external_file(path, "recovery file")?;
+    material_from_recovery_file(project, &path, recovery_passphrase)
 }
 
 /// Rewrites the vault from recovery material, returning it to passphrase encryption.
@@ -170,6 +171,7 @@ pub fn restore_vault_from_recovery_file(
 pub fn import_recovery_file(source: &std::path::Path) -> Result<PathBuf> {
     let dir = logs::recovery_dir();
     fs_util::ensure_private_dir(&dir)?;
+    let source = fs_util::resolve_existing_external_file(source, "recovery source")?;
 
     let filename = source
         .file_name()
@@ -178,7 +180,8 @@ pub fn import_recovery_file(source: &std::path::Path) -> Result<PathBuf> {
         .into_owned();
 
     let dest = dir.join(&filename);
-    let contents = std::fs::read(source).context(format!("failed to read {}", source.display()))?;
+    let contents =
+        std::fs::read(&source).context(format!("failed to read {}", source.display()))?;
     fs_util::write_private_file(&dest, &contents)?;
     Ok(dest)
 }
@@ -202,11 +205,12 @@ pub fn export_recovery_file(
     let contents =
         std::fs::read(&source).context(format!("failed to read {}", source.display()))?;
 
-    let out_path = if dest.is_dir() {
+    let requested_out = if dest.is_dir() {
         dest.join(&filename)
     } else {
         dest.to_path_buf()
     };
+    let out_path = fs_util::resolve_external_output(&requested_out, "recovery export path")?;
 
     std::fs::write(&out_path, contents)
         .context(format!("failed to write {}", out_path.display()))?;

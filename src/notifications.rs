@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     approvals::ApprovalScope,
     detection::Finding,
-    fs_util, logs,
+    fs_util,
     pending_requests::{self, PendingRequest},
     worktrees::{self, PendingWorktree},
 };
@@ -92,7 +92,11 @@ pub struct BlockNotification {
 }
 
 pub fn notification_dir() -> PathBuf {
-    logs::ward_home().join("notifications")
+    fs_util::resolve_ward_home_path(
+        std::path::Path::new("notifications"),
+        "notifications directory",
+    )
+    .expect("notifications directory should stay inside Ward home")
 }
 
 pub fn create_block_notification(
@@ -329,7 +333,9 @@ fn write_block_notification(notification: &BlockNotification) -> Result<()> {
 }
 
 fn block_notification_path(id: uuid::Uuid) -> PathBuf {
-    notification_dir().join(format!("{id}.json"))
+    let relative = PathBuf::from("notifications").join(format!("{id}.json"));
+    fs_util::resolve_ward_home_path(&relative, "notification path")
+        .expect("notification path should stay inside Ward home")
 }
 
 #[cfg(test)]

@@ -83,7 +83,9 @@ pub enum GrantIntegrityStatus {
 }
 
 pub fn grants_path() -> PathBuf {
-    logs::ward_home().join("sessions").join("grants.jsonl")
+    let relative = PathBuf::from("sessions").join("grants.jsonl");
+    fs_util::resolve_ward_home_path(&relative, "approval grants path")
+        .expect("approval grants path should stay inside Ward home")
 }
 
 pub fn find_matching_grant(access: &AccessRequest) -> Result<Option<ApprovalGrant>> {

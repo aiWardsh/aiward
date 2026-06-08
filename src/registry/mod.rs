@@ -59,7 +59,8 @@ pub struct ResolvedProject {
 }
 
 pub fn registry_path() -> PathBuf {
-    logs::ward_home().join("registry.json")
+    fs_util::resolve_ward_home_path(Path::new("registry.json"), "registry path")
+        .expect("registry path should stay inside Ward home")
 }
 
 pub fn load_registry() -> Result<Registry> {
@@ -70,7 +71,9 @@ pub fn load_registry() -> Result<Registry> {
 
     let contents =
         fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents).context(format!("failed to parse {}", path.display()))
+    let registry: Registry =
+        serde_json::from_str(&contents).context(format!("failed to parse {}", path.display()))?;
+    Ok(sanitize_registry(registry))
 }
 
 pub fn save_registry(registry: &Registry) -> Result<()> {
@@ -87,6 +90,7 @@ pub fn register_project(
     vault: PathBuf,
 ) -> Result<RegisteredProject> {
     let mut registry = load_registry()?;
+    let vault = validate_vault_path(&path, &vault)?;
     let git = collect_git_context(&path);
     let canonical_repo_path = path.canonicalize().ok();
     let registered = RegisteredProject {
@@ -117,6 +121,7 @@ pub fn register_project(
 
 pub fn update_project_vault(project: &str, path: PathBuf, vault: PathBuf) -> Result<()> {
     let mut registry = load_registry()?;
+    let vault = validate_vault_path(&path, &vault)?;
     let git = collect_git_context(&path);
     let canonical_repo_path = path.canonicalize().ok();
     match registry.projects.get_mut(project) {
@@ -211,12 +216,9 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
     let local_config_root =
         crate::config::find_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     if let Ok(config) = read_project_config(&local_config_root) {
-        if let Some(registered) = registry.projects.get(&config.project) {
-            return Ok(ResolvedProject {
-                name: config.project,
-                path: registered.path.clone(),
-                vault: registered.vault.clone(),
-            });
+        if registry.projects.contains_key(&config.project) {
+            return registered_project(&registry, &config.project)
+                .context(format!("project {} is not registered", config.project));
         }
 
         return Ok(ResolvedProject {
@@ -236,7 +238,7 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
             return Ok(ResolvedProject {
                 name: name.clone(),
                 path: registered.path.clone(),
-                vault: registered.vault.clone(),
+                vault: validate_vault_path(&registered.path, &registered.vault)?,
             });
         }
     }
@@ -257,7 +259,7 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
         return Ok(ResolvedProject {
             name: name.clone(),
             path: registered.path.clone(),
-            vault: registered.vault.clone(),
+            vault: validate_vault_path(&registered.path, &registered.vault)?,
         });
     }
 
@@ -286,11 +288,35 @@ pub fn resolve_project_with_passphrase(
 
 fn registered_project(registry: &Registry, project: &str) -> Option<ResolvedProject> {
     let registered = registry.projects.get(project)?;
+    let vault = validate_vault_path(&registered.path, &registered.vault).ok()?;
     Some(ResolvedProject {
         name: project.to_string(),
         path: registered.path.clone(),
-        vault: registered.vault.clone(),
+        vault,
     })
+}
+
+fn sanitize_registry(mut registry: Registry) -> Registry {
+    registry
+        .projects
+        .retain(|_, registered| validate_registered_project(registered).is_ok());
+    if registry
+        .active_project
+        .as_ref()
+        .is_some_and(|project| !registry.projects.contains_key(project))
+    {
+        registry.active_project = None;
+    }
+    registry
+}
+
+fn validate_registered_project(registered: &RegisteredProject) -> Result<()> {
+    validate_vault_path(&registered.path, &registered.vault)?;
+    Ok(())
+}
+
+fn validate_vault_path(project_path: &Path, vault: &Path) -> Result<PathBuf> {
+    fs_util::resolve_project_path(project_path, vault, "registry vault path")
 }
 
 #[cfg(test)]
@@ -418,6 +444,77 @@ mod tests {
         assert_eq!(resolved.vault, vault);
         assert!(set_active_project("missing").is_err());
         assert!(resolve_project(Some("missing"), project.path()).is_err());
+
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn register_and_update_reject_vault_outside_project() {
+        let _guard = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        set_home(home.path());
+
+        let outside_vault = outside.path().join("outside.vault");
+        let register_error = register_project(
+            "demo".to_string(),
+            project.path().to_path_buf(),
+            outside_vault.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(register_error.contains("must stay inside"));
+
+        let update_error =
+            update_project_vault("demo", project.path().to_path_buf(), outside_vault)
+                .unwrap_err()
+                .to_string();
+        assert!(update_error.contains("must stay inside"));
+
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_registry_filters_invalid_vault_paths() {
+        let _guard = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let valid_project = tempfile::tempdir().unwrap();
+        let invalid_project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        set_home(home.path());
+        std::fs::create_dir_all(home.path()).unwrap();
+
+        let mut registry = Registry {
+            active_project: Some("invalid".to_string()),
+            projects: BTreeMap::new(),
+        };
+        registry.projects.insert(
+            "valid".to_string(),
+            registered(
+                valid_project.path(),
+                &valid_project.path().join(".env.vault"),
+            ),
+        );
+        registry.projects.insert(
+            "invalid".to_string(),
+            registered(
+                invalid_project.path(),
+                &outside.path().join("outside.vault"),
+            ),
+        );
+        std::fs::write(
+            registry_path(),
+            serde_json::to_string_pretty(&registry).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_registry().unwrap();
+        assert!(loaded.projects.contains_key("valid"));
+        assert!(!loaded.projects.contains_key("invalid"));
+        assert!(loaded.active_project.is_none());
 
         std::env::remove_var("WARD_HOME");
     }

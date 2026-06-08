@@ -77,7 +77,11 @@ pub struct CriticalConfirmation {
 }
 
 pub fn requests_dir() -> PathBuf {
-    logs::ward_home().join("requests")
+    fs_util::resolve_ward_home_path(
+        std::path::Path::new("requests"),
+        "pending requests directory",
+    )
+    .expect("pending requests directory should stay inside Ward home")
 }
 
 pub fn pending_request_path(id: uuid::Uuid) -> PathBuf {
@@ -241,11 +245,17 @@ fn write_pending_request(pending: &PendingRequest) -> Result<()> {
 }
 
 fn request_path(id: uuid::Uuid) -> PathBuf {
-    requests_dir().join(format!("{id}.json"))
+    let relative = PathBuf::from("requests").join(format!("{id}.json"));
+    fs_util::resolve_ward_home_path(&relative, "pending request path")
+        .expect("pending request path should stay inside Ward home")
 }
 
 fn resolution_path(id: uuid::Uuid) -> PathBuf {
-    requests_dir().join("resolved").join(format!("{id}.json"))
+    let relative = PathBuf::from("requests")
+        .join("resolved")
+        .join(format!("{id}.json"));
+    fs_util::resolve_ward_home_path(&relative, "pending request resolution path")
+        .expect("pending request resolution path should stay inside Ward home")
 }
 
 fn critical_confirmation(pending: &PendingRequest) -> CriticalConfirmation {

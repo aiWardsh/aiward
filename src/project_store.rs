@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::{AgentPolicyConfig, ProfileConfig, ProjectConfig},
-    env_file, fs_util, logs, vault,
+    env_file, fs_util, vault,
 };
 
 const STORE_RECORD_VERSION: u32 = 1;
@@ -86,11 +86,14 @@ pub struct ProjectStoreDiagnostics {
 }
 
 pub fn projects_dir() -> PathBuf {
-    logs::ward_home().join(PROJECT_STORE_DIR)
+    fs_util::resolve_ward_home_path(Path::new(PROJECT_STORE_DIR), "project store directory")
+        .expect("project store directory should stay inside Ward home")
 }
 
 pub fn record_path(project: &str) -> PathBuf {
-    projects_dir().join(format!("{}.json", slugify(project)))
+    let relative = PathBuf::from(PROJECT_STORE_DIR).join(format!("{}.json", slugify(project)));
+    fs_util::resolve_ward_home_path(&relative, "project store record")
+        .expect("project store record should stay inside Ward home")
 }
 
 pub fn list_summaries() -> Result<Vec<ProjectStoreSummary>> {

@@ -78,15 +78,19 @@ fn default_ward_home() -> PathBuf {
 }
 
 pub fn logs_dir() -> PathBuf {
-    ward_home().join("logs")
+    fs_util::resolve_ward_home_path(Path::new("logs"), "logs directory")
+        .expect("logs directory should stay inside Ward home")
 }
 
 pub fn recovery_dir() -> PathBuf {
-    ward_home().join("recovery")
+    fs_util::resolve_ward_home_path(Path::new("recovery"), "recovery directory")
+        .expect("recovery directory should stay inside Ward home")
 }
 
 pub fn project_modes_dir(project: &str) -> PathBuf {
-    ward_home().join("projects").join(slugify(project))
+    let relative = PathBuf::from("projects").join(slugify(project));
+    fs_util::resolve_ward_home_path(&relative, "project modes directory")
+        .expect("project modes directory should stay inside Ward home")
 }
 
 fn slugify(project: &str) -> String {
@@ -103,7 +107,8 @@ fn slugify(project: &str) -> String {
 }
 
 fn cache_dir() -> PathBuf {
-    ward_home().join("cache")
+    fs_util::resolve_ward_home_path(Path::new("cache"), "cache directory")
+        .expect("cache directory should stay inside Ward home")
 }
 
 fn log_key_path() -> PathBuf {
