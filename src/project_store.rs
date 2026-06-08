@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::{AgentPolicyConfig, ProfileConfig, ProjectConfig},
-    env_file, fs_util, logs, teams, vault,
+    env_file, fs_util, logs, vault,
 };
 
 const STORE_RECORD_VERSION: u32 = 1;
@@ -33,8 +33,6 @@ pub struct ProjectStoreRecord {
     pub encrypted_secrets: EncryptedProjectSecrets,
     #[serde(default)]
     pub recipient_key_wraps: Vec<ProjectStoreRecipient>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub team: Option<teams::TeamSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,7 +233,6 @@ pub fn record_from_plaintext(
             payload,
         },
         recipient_key_wraps: Vec::new(),
-        team: teams::snapshot(project)?,
     })
 }
 
@@ -367,59 +364,6 @@ mod tests {
         let serialized = serde_json::to_string(&record).unwrap();
         assert!(serialized.contains("API_KEY"));
         assert!(serialized.contains("codex"));
-        assert!(!serialized.contains("super-secret-value"));
-    }
-
-    #[test]
-    #[serial]
-    fn store_record_includes_team_metadata_without_secret_values() {
-        let home = tempfile::tempdir().unwrap();
-        let _guard = WardHomeGuard::set(home.path());
-        let tempdir = tempfile::tempdir().unwrap();
-        let mut team = teams::default_record("demo");
-        teams::upsert_member(
-            &mut team,
-            teams::TeamMemberInput {
-                id: "dev@example.com".to_string(),
-                name: Some("Developer".to_string()),
-                role: Some(teams::TeamRole::Developer),
-                agents: vec!["codex".to_string()],
-            },
-            None,
-        )
-        .unwrap();
-        teams::upsert_policy(
-            &mut team,
-            teams::TeamPolicyInput {
-                name: "codex-dev".to_string(),
-                member_id: Some("dev@example.com".to_string()),
-                agents: vec!["codex".to_string()],
-                profiles: vec!["dev".to_string()],
-                env: vec!["API_KEY".to_string()],
-            },
-            None,
-        )
-        .unwrap();
-        teams::write_record(&team).unwrap();
-
-        let config =
-            ProjectConfig::default_for_dir(tempdir.path(), Some("demo".to_string())).unwrap();
-        let record = record_from_plaintext(
-            "demo",
-            tempdir.path(),
-            &tempdir.path().join(".env.vault"),
-            &config,
-            "API_KEY=super-secret-value\n",
-            "1234",
-        )
-        .unwrap();
-
-        let team = record.team.as_ref().unwrap();
-        assert_eq!(team.policy_count, 1);
-        assert_eq!(team.agents, vec!["codex".to_string()]);
-        let serialized = serde_json::to_string(&record).unwrap();
-        assert!(serialized.contains("codex"));
-        assert!(serialized.contains("API_KEY"));
         assert!(!serialized.contains("super-secret-value"));
     }
 }

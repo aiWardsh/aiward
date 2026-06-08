@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config, env_file, grants, logs, pending_requests, project_store, registry, teams, unlock,
-    vault, worktrees,
+    config, env_file, grants, logs, pending_requests, project_store, registry, unlock, vault,
+    worktrees,
 };
 
 #[derive(Debug, Clone)]
@@ -91,9 +91,6 @@ pub fn teardown_project(request: ProjectTeardownRequest) -> Result<ProjectTeardo
     let cleared_unlock_sessions = unlock::clear_project_unlocks(&request.project)?;
     let mut removed_store_records = 0;
     if project_store::remove_record(&request.project)? {
-        removed_store_records += 1;
-    }
-    if teams::remove_record(&request.project)? {
         removed_store_records += 1;
     }
 

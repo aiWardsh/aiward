@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     agents, anomaly,
     approvals::{self, ApprovalChannel, ApprovalDecision, ApprovalScope},
-    broker, cloud, config, context, detection, env_file, git_context, grants,
+    broker, config, context, detection, env_file, git_context, grants,
     logs::{self as audit_logs, self as logs, LogKind},
     modes, notifications, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
@@ -63,8 +63,6 @@ pub struct Cli {
 pub enum Commands {
     /// Initialize, import, register, and create short profiles.
     Setup {
-        #[command(subcommand)]
-        command: Option<SetupCommand>,
         #[arg(long)]
         yes: bool,
         #[arg(long)]
@@ -131,16 +129,6 @@ pub enum Commands {
     Store {
         #[command(subcommand)]
         command: StoreCommand,
-    },
-    /// Sign in to a Ward local-cloud account.
-    Auth {
-        #[command(subcommand)]
-        command: AuthCommand,
-    },
-    /// Manage the local cloud-shaped team backend.
-    Cloud {
-        #[command(subcommand)]
-        command: CloudCommand,
     },
     /// Manage the current project's dotenv vault and locked .env file.
     Env {
@@ -447,15 +435,6 @@ pub enum Commands {
         #[arg(long)]
         token: String,
     },
-    #[command(hide = true, name = "__cloud-dev-server")]
-    CloudDevServer {
-        #[arg(long)]
-        port: u16,
-        #[arg(long)]
-        token: String,
-        #[arg(long)]
-        db: PathBuf,
-    },
     #[command(hide = true, name = "__human-guardian")]
     HumanGuardian {
         #[arg(long)]
@@ -507,23 +486,6 @@ pub enum ProjectsCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum SetupCommand {
-    /// Import an invited cloud project/environment into this folder.
-    Login {
-        #[arg(long, default_value_t = cloud::default_cloud_url())]
-        cloud_url: String,
-        #[arg(long)]
-        team: Option<String>,
-        #[arg(long)]
-        project: Option<String>,
-        #[arg(long)]
-        environment: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 pub enum StoreCommand {
     /// List encrypted project-store snapshots.
     List {
@@ -540,80 +502,6 @@ pub enum StoreCommand {
     Refresh {
         #[arg(long)]
         project: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AuthCommand {
-    /// Create or select a local cloud account and device.
-    Login {
-        #[arg(long, default_value_t = cloud::default_cloud_url())]
-        cloud_url: String,
-        #[arg(long)]
-        email: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        device_name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum CloudCommand {
-    /// Manage the local cloud-shaped backend.
-    Dev {
-        #[command(subcommand)]
-        command: CloudDevCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum CloudDevCommand {
-    /// Start the localhost cloud-dev service.
-    Start {
-        #[arg(long)]
-        port: Option<u16>,
-        #[arg(long)]
-        db: Option<PathBuf>,
-        #[arg(long)]
-        foreground: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Stop the localhost cloud-dev service.
-    Stop {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show localhost cloud-dev status.
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Publish selected envs from a local Ward project into the local cloud-dev database.
-    Publish {
-        #[arg(long, default_value_t = cloud::default_cloud_url())]
-        cloud_url: String,
-        #[arg(long)]
-        project: Option<String>,
-        #[arg(long)]
-        team: String,
-        #[arg(long)]
-        cloud_project: Option<String>,
-        #[arg(long, default_value = "development")]
-        environment: String,
-        #[arg(long = "env")]
-        env_names: Vec<String>,
-        #[arg(long = "profile")]
-        profiles: Vec<String>,
-        #[arg(long = "agent")]
-        agents: Vec<String>,
-        #[arg(long = "member")]
-        members: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -919,7 +807,6 @@ pub enum RecoveryCommand {
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Setup {
-            command,
             yes,
             project,
             source,
@@ -934,9 +821,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             apps,
             all,
         } => {
-            if let Some(command) = command {
-                return setup_command(command);
-            }
             let options = SetupOptions {
                 yes,
                 project,
@@ -970,8 +854,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Projects { command } => projects_command(command),
         Commands::Config { command } => config_command(command),
         Commands::Store { command } => store_command(command),
-        Commands::Auth { command } => auth_command(command),
-        Commands::Cloud { command } => cloud_command(command),
         Commands::Env { command } => env_command(command),
         Commands::Request {
             project,
@@ -1183,7 +1065,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => recovery_command(project, app, command),
         Commands::Dashboard { command } => dashboard_command(command),
         Commands::DashboardServer { port, token } => crate::webui::serve_standalone(port, token),
-        Commands::CloudDevServer { port, token, db } => cloud::serve_standalone(port, token, db),
         Commands::Human {
             project,
             app,
@@ -2148,7 +2029,6 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
                     profiles,
                     env_names,
                     agents,
-                    members: Vec::new(),
                 })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
@@ -2170,250 +2050,6 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn setup_command(command: SetupCommand) -> Result<()> {
-    match command {
-        SetupCommand::Login {
-            cloud_url,
-            team,
-            project,
-            environment,
-            json,
-        } => {
-            let cwd = env::current_dir()?;
-            let auth = cloud::load_auth_session(&cloud_url)?;
-            let pin = vault::read_existing_passphrase()?;
-            let imported = cloud::import_from_cloud(cloud::SetupLoginOptions {
-                db: cloud::default_db_path(),
-                cloud_url,
-                auth,
-                pin,
-                target_dir: cwd,
-                team,
-                project,
-                environment,
-            })?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&imported)?);
-            } else {
-                term::guided_header(
-                    "setup login",
-                    &imported.local_project,
-                    &imported.path,
-                    "Ward imported this cloud-managed project into a local encrypted vault.",
-                );
-                term::section("cloud");
-                term::ok_detail(
-                    "source",
-                    &format!(
-                        "{} / {} / {}",
-                        imported.team, imported.project, imported.environment
-                    ),
-                );
-                term::section("vault");
-                term::ok_detail("encrypted vault", &term::short_path(&imported.vault));
-                term::ok_detail("env names imported", &imported.env_names.join(", "));
-                term::section("project");
-                term::ok(".ward.json compiled from cloud policies");
-                term::ok("project registered");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn auth_command(command: AuthCommand) -> Result<()> {
-    match command {
-        AuthCommand::Login {
-            cloud_url,
-            email,
-            name,
-            device_name,
-            json,
-        } => {
-            let email = match email {
-                Some(email) => email,
-                None => inquire::Text::new("Account email").prompt()?,
-            };
-            let pin =
-                vault::read_new_pin("New local Ward cloud PIN", "Confirm local Ward cloud PIN")?;
-            let session = cloud::login_account(cloud::AuthLoginOptions {
-                cloud_url,
-                email,
-                name,
-                device_name,
-                pin,
-            })?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&cloud::CloudAuthSummary::from(session))?
-                );
-            } else {
-                term::guided_header(
-                    "auth login",
-                    &session.account_email,
-                    Path::new("."),
-                    "Ward created a local cloud account session and encrypted this device key with your PIN.",
-                );
-                term::section("account");
-                term::ok_detail("signed in", &session.account_email);
-                term::section("device");
-                term::ok_detail("registered", &session.device_id);
-                term::next("run: ward setup login");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn cloud_command(command: CloudCommand) -> Result<()> {
-    match command {
-        CloudCommand::Dev { command } => cloud_dev_command(command),
-    }
-}
-
-fn cloud_dev_command(command: CloudDevCommand) -> Result<()> {
-    match command {
-        CloudDevCommand::Start {
-            port,
-            db,
-            foreground,
-            json,
-        } => {
-            cloud::start_dev_server(cloud::CloudDevStartOptions {
-                port,
-                db,
-                foreground,
-                json,
-            })?;
-        }
-        CloudDevCommand::Stop { json } => {
-            cloud::stop_dev_server(cloud::CloudDevStopOptions { json })?;
-        }
-        CloudDevCommand::Status { json } => {
-            cloud::status(json)?;
-        }
-        CloudDevCommand::Publish {
-            cloud_url,
-            project,
-            team,
-            cloud_project,
-            environment,
-            env_names,
-            profiles,
-            agents,
-            members,
-            json,
-        } => publish_cloud_environment(
-            cloud_url,
-            project,
-            team,
-            cloud_project,
-            environment,
-            env_names,
-            profiles,
-            agents,
-            members,
-            json,
-        )?,
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn publish_cloud_environment(
-    cloud_url: String,
-    project: Option<String>,
-    team: String,
-    cloud_project: Option<String>,
-    environment: String,
-    env_names: Vec<String>,
-    profiles: Vec<String>,
-    agents: Vec<String>,
-    members: Vec<String>,
-    json: bool,
-) -> Result<()> {
-    let cwd = env::current_dir()?;
-    let source = registry::resolve_project(project.as_deref(), &cwd)?;
-    let auth = cloud::load_auth_session(&cloud_url)?;
-    let owner_pin = vault::read_existing_passphrase()?;
-    let source_passphrase = if source.vault.exists() {
-        vault::read_existing_passphrase()?
-    } else {
-        anyhow::bail!("source vault is missing: {}", source.vault.display());
-    };
-    let member_inputs = parse_cloud_members(members)?;
-    let published = cloud::publish_environment(cloud::PublishEnvironmentOptions {
-        db: cloud::default_db_path(),
-        cloud_url,
-        owner: auth,
-        owner_pin,
-        source_project: source.name.clone(),
-        source_path: source.path.clone(),
-        source_vault: source.vault.clone(),
-        source_passphrase,
-        team_name: team,
-        project_name: cloud_project.unwrap_or_else(|| source.name.clone()),
-        environment_name: environment,
-        env_names,
-        profile_names: profiles,
-        agent_names: agents,
-        members: member_inputs,
-    })?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&published)?);
-    } else {
-        term::emit_header(&term::Header {
-            command: Some("cloud dev publish"),
-            project: &published.project.name,
-            path: Some(&source.path),
-            mode: None,
-        });
-        term::ok_detail(
-            "published",
-            &format!(
-                "{} / {} / {}",
-                published.team.name, published.project.name, published.environment.name
-            ),
-        );
-        term::ok_detail("env", &published.environment.env_names.join(", "));
-        term::ok_detail("wrapped devices", &published.wrapped_devices.to_string());
-        if !published.rewrap_required_members.is_empty() {
-            term::warn_detail(
-                "rewrap required",
-                &format!(
-                    "after device login: {}",
-                    published.rewrap_required_members.join(", ")
-                ),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn parse_cloud_members(values: Vec<String>) -> Result<Vec<cloud::CloudMemberInput>> {
-    values
-        .into_iter()
-        .map(|value| {
-            let mut parts = value.splitn(2, ':');
-            let email = parts
-                .next()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .context("member must be formatted as email:role")?
-                .to_string();
-            let role = match parts.next().map(str::trim).unwrap_or("developer") {
-                "owner" => cloud::CloudRole::Owner,
-                "admin" => cloud::CloudRole::Admin,
-                "developer" => cloud::CloudRole::Developer,
-                "viewer" => cloud::CloudRole::Viewer,
-                other => anyhow::bail!("unsupported cloud member role: {other}"),
-            };
-            Ok(cloud::CloudMemberInput { email, role })
-        })
-        .collect()
 }
 
 fn store_command(command: StoreCommand) -> Result<()> {
@@ -8570,7 +8206,6 @@ mod tests {
 
         dispatch(Cli {
             command: Commands::Setup {
-                command: None,
                 yes: true,
                 project: Some("kept".to_string()),
                 source: ".env".into(),
@@ -8793,7 +8428,6 @@ mod tests {
 
         let dispatch_conflict = dispatch(Cli {
             command: Commands::Setup {
-                command: None,
                 yes: true,
                 project: Some("demo".to_string()),
                 source: "missing.env".into(),
@@ -9054,7 +8688,6 @@ mod tests {
 
         dispatch(Cli {
             command: Commands::Setup {
-                command: None,
                 yes: true,
                 project: Some("demo".to_string()),
                 source: ".env".into(),
@@ -11047,58 +10680,6 @@ mod tests {
             vec!["ward", "dashboard", "stop", "--port", "7780"],
             vec!["ward", "dashboard", "status", "--json"],
             vec!["ward", "dashboard", "tui"],
-            vec![
-                "ward",
-                "auth",
-                "login",
-                "--cloud-url",
-                "http://127.0.0.1:8787",
-                "--email",
-                "owner@example.com",
-                "--json",
-            ],
-            vec![
-                "ward",
-                "setup",
-                "login",
-                "--cloud-url",
-                "http://127.0.0.1:8787",
-                "--team",
-                "team",
-                "--project",
-                "project",
-                "--environment",
-                "development",
-                "--json",
-            ],
-            vec!["ward", "cloud", "dev", "start", "--port", "8787", "--json"],
-            vec!["ward", "cloud", "dev", "status", "--json"],
-            vec!["ward", "cloud", "dev", "stop", "--json"],
-            vec![
-                "ward",
-                "cloud",
-                "dev",
-                "publish",
-                "--cloud-url",
-                "http://127.0.0.1:8787",
-                "--project",
-                "ward",
-                "--team",
-                "team",
-                "--cloud-project",
-                "project",
-                "--environment",
-                "development",
-                "--env",
-                "DATABASE_URL",
-                "--profile",
-                "dev",
-                "--agent",
-                "codex",
-                "--member",
-                "dev@example.com:developer",
-                "--json",
-            ],
             vec!["ward", "edit"],
             vec!["ward", "unlock", "--ttl", "1h"],
             vec!["ward", "lock"],
@@ -11116,6 +10697,14 @@ mod tests {
 
         for args in command_sets {
             assert!(Cli::try_parse_from(args).is_ok());
+        }
+
+        for args in [
+            vec!["ward", "auth", "login"],
+            vec!["ward", "cloud", "dev", "start"],
+            vec!["ward", "setup", "login"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
 
@@ -11243,7 +10832,6 @@ mod tests {
             format!(
                 "{:?}",
                 Commands::Setup {
-                    command: None,
                     yes: true,
                     project: Some("demo".to_string()),
                     source: ".env".into(),
@@ -11257,91 +10845,6 @@ mod tests {
                     workspace: false,
                     apps: Vec::new(),
                     all: false,
-                }
-            ),
-            format!(
-                "{:?}",
-                Commands::Setup {
-                    command: Some(SetupCommand::Login {
-                        cloud_url: "http://127.0.0.1:8787".to_string(),
-                        team: Some("team".to_string()),
-                        project: Some("project".to_string()),
-                        environment: Some("development".to_string()),
-                        json: true,
-                    }),
-                    yes: false,
-                    project: None,
-                    source: ".env".into(),
-                    vault: ".env.vault".into(),
-                    commit_vault: false,
-                    ignore_vault: false,
-                    remove_plaintext: false,
-                    keep_plaintext: false,
-                    unlock_ttl: "8h".to_string(),
-                    no_unlock: false,
-                    workspace: false,
-                    apps: Vec::new(),
-                    all: false,
-                }
-            ),
-            format!(
-                "{:?}",
-                Commands::Auth {
-                    command: AuthCommand::Login {
-                        cloud_url: "http://127.0.0.1:8787".to_string(),
-                        email: Some("owner@example.com".to_string()),
-                        name: None,
-                        device_name: None,
-                        json: true,
-                    },
-                }
-            ),
-            format!(
-                "{:?}",
-                Commands::Cloud {
-                    command: CloudCommand::Dev {
-                        command: CloudDevCommand::Start {
-                            port: Some(8787),
-                            db: None,
-                            foreground: false,
-                            json: true,
-                        },
-                    },
-                }
-            ),
-            format!(
-                "{:?}",
-                Commands::Cloud {
-                    command: CloudCommand::Dev {
-                        command: CloudDevCommand::Status { json: true },
-                    },
-                }
-            ),
-            format!(
-                "{:?}",
-                Commands::Cloud {
-                    command: CloudCommand::Dev {
-                        command: CloudDevCommand::Stop { json: true },
-                    },
-                }
-            ),
-            format!(
-                "{:?}",
-                Commands::Cloud {
-                    command: CloudCommand::Dev {
-                        command: CloudDevCommand::Publish {
-                            cloud_url: "http://127.0.0.1:8787".to_string(),
-                            project: Some("ward".to_string()),
-                            team: "team".to_string(),
-                            cloud_project: Some("project".to_string()),
-                            environment: "development".to_string(),
-                            env_names: vec!["DATABASE_URL".to_string()],
-                            profiles: vec!["dev".to_string()],
-                            agents: vec!["codex".to_string()],
-                            members: vec!["dev@example.com:developer".to_string()],
-                            json: true,
-                        },
-                    },
                 }
             ),
             format!(

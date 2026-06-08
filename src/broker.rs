@@ -31,7 +31,7 @@ use crate::{
     policy::{self, AccessRequest},
     project_store, project_teardown, recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
-    teams, unlock, vault,
+    unlock, vault,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,7 +145,6 @@ pub struct ProjectProvisionRequest {
     pub profiles: Vec<String>,
     pub env_names: Vec<String>,
     pub agents: Vec<String>,
-    pub members: Vec<teams::TeamMemberInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,8 +301,6 @@ enum BrokerRequest {
         profiles: Vec<String>,
         env_names: Vec<String>,
         agents: Vec<String>,
-        #[serde(default)]
-        members: Vec<teams::TeamMemberInput>,
     },
     RemoveProject {
         project: String,
@@ -998,7 +995,6 @@ pub fn provision_project_from_active_session(
         profiles: request.profiles,
         env_names: request.env_names,
         agents: request.agents,
-        members: request.members,
     })? {
         BrokerResponse::ProjectProvision { status } => Ok(status),
         BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
@@ -1622,7 +1618,6 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             profiles,
             env_names,
             agents,
-            members,
         } => {
             if let Err(message) = require_trusted_client(&stream) {
                 let response = broker_error("broker_client_untrusted", message);
@@ -1649,7 +1644,6 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 profiles,
                 env_names,
                 agents,
-                members,
             };
             let provision_result = {
                 let passphrase = material.passphrase.clone();
@@ -1989,25 +1983,6 @@ fn provision_project_with_material(
         target_config.recovery_created = true;
         let _ = config::write_project_config(&target_path, &target_config, true);
     }
-
-    let mut team_record = teams::default_record(&request.project);
-    for member in request.members.clone() {
-        teams::upsert_member(&mut team_record, member, None)?;
-    }
-    if !selected_agents.is_empty() {
-        teams::upsert_policy(
-            &mut team_record,
-            teams::TeamPolicyInput {
-                name: "provisioned-agents".to_string(),
-                member_id: Some(teams::current_member_id()),
-                agents: selected_agents.clone(),
-                profiles: profile_names.clone(),
-                env: selected_env.clone(),
-            },
-            None,
-        )?;
-    }
-    teams::write_record(&team_record)?;
 
     registry::update_project_vault(&request.project, target_path.clone(), vault_path.clone())?;
     let store = project_store::refresh_from_plaintext(
@@ -3902,7 +3877,6 @@ mod tests {
                 profiles: vec!["dev".to_string()],
                 env_names: vec!["DATABASE_URL".to_string()],
                 agents: vec!["codex".to_string()],
-                members: Vec::new(),
             },
             &material,
         )

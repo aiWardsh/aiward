@@ -23,13 +23,13 @@ use std::os::unix::process::CommandExt;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::{
-    approvals, broker, cloud,
+    approvals, broker,
     config::{self, ProfileConfig},
     fs_util, human,
     logs::{self, LogKind},
     notifications, project_store, project_teardown,
     registry::{self, RegisteredProject},
-    teams, term, workspace, worktrees,
+    term, workspace, worktrees,
 };
 
 const DEFAULT_PORT: u16 = 7777;
@@ -85,17 +85,6 @@ struct DashboardStatus {
     instances: Vec<DashboardInstance>,
     broker: broker::BrokerStatus,
     human: HumanRuntimeView,
-    cloud: cloud::CloudDashboardStatus,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CloudDashboardView {
-    status: cloud::CloudDashboardStatus,
-    teams: Vec<cloud::TeamView>,
-    catalog: Option<cloud::CloudCatalog>,
-    audit: Vec<cloud::CloudAuditEvent>,
-    auth_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,7 +119,6 @@ struct ProjectView {
     broker_session_active: bool,
     broker_session_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     store_snapshot: Option<project_store::ProjectStoreSummary>,
-    team: teams::TeamSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,8 +188,6 @@ struct ProjectProvisionRequest {
     env: Vec<String>,
     #[serde(default)]
     agents: Vec<String>,
-    #[serde(default)]
-    members: Vec<teams::TeamMemberInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,29 +202,6 @@ struct RemoveProjectRequest {
 
 fn default_remove_export_path() -> PathBuf {
     PathBuf::from(".env.export")
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TeamMemberRequest {
-    id: String,
-    name: Option<String>,
-    role: Option<teams::TeamRole>,
-    #[serde(default)]
-    agents: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TeamPolicyRequest {
-    name: String,
-    member_id: Option<String>,
-    #[serde(default)]
-    agents: Vec<String>,
-    #[serde(default)]
-    profiles: Vec<String>,
-    #[serde(default)]
-    env: Vec<String>,
 }
 
 pub fn start_dashboard(options: DashboardStartOptions) -> Result<()> {
@@ -505,26 +468,7 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             respond_notifications_stream(req);
         }
         (Method::Get, "/api/dashboard/status") => respond_json_result(req, dashboard_status()),
-        (Method::Get, "/api/cloud") => respond_json_result(req, cloud_dashboard_view()),
-        (Method::Get, "/api/cloud/status") => respond_json_result(req, cloud::dashboard_status()),
-        (Method::Get, "/api/cloud/teams") => {
-            respond_json_result(req, cloud::list_teams(&cloud::default_db_path()))
-        }
-        (Method::Get, "/api/cloud/catalog") => respond_json_result(req, cloud_catalog_view()),
-        (Method::Get, "/api/cloud/audit/events") => {
-            let team = query_param(&query, "teamId");
-            respond_json_result(
-                req,
-                cloud::list_audit_events(&cloud::default_db_path(), team.as_deref()),
-            )
-        }
-        (Method::Get, _) => {
-            if let Some(project) = team_project_route(&path) {
-                respond_json_result(req, team_view(&project));
-            } else {
-                respond_not_found(req);
-            }
-        }
+        (Method::Get, _) => respond_not_found(req),
         (Method::Post, "/api/projects/pick-folder") => {
             let result = pick_project_folder(&mut req);
             respond_json_result(req, result);
@@ -562,12 +506,6 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             } else if let Some((request_id, action)) = worktree_action_route(&path) {
                 let result = worktree_action(request_id, &action);
                 respond_json_result(req, result);
-            } else if let Some(project) = team_members_collection_route(&path) {
-                let result = create_team_member(&project, &mut req);
-                respond_team_result(req, result);
-            } else if let Some(project) = team_policies_collection_route(&path) {
-                let result = create_team_policy(&project, &mut req);
-                respond_team_result(req, result);
             } else if let Some(project) = profiles_collection_route(&path) {
                 let result = create_profile_policy(&project, &mut req);
                 respond_json_result(req, result);
@@ -582,13 +520,7 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             }
         }
         (Method::Patch, _) => {
-            if let Some((project, member)) = team_member_route(&path) {
-                let result = update_team_member(&project, &member, &mut req);
-                respond_team_result(req, result);
-            } else if let Some((project, policy)) = team_policy_route(&path) {
-                let result = update_team_policy(&project, &policy, &mut req);
-                respond_team_result(req, result);
-            } else if let Some((project, profile)) = profile_policy_route(&path) {
+            if let Some((project, profile)) = profile_policy_route(&path) {
                 let result = update_profile_policy(&project, &profile, &mut req);
                 respond_json_result(req, result);
             } else if let Some((project, profile)) = profile_env_route(&path) {
@@ -599,13 +531,7 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             }
         }
         (Method::Delete, _) => {
-            if let Some((project, member)) = team_member_route(&path) {
-                let result = delete_team_member(&project, &member);
-                respond_team_result(req, result);
-            } else if let Some((project, policy)) = team_policy_route(&path) {
-                let result = delete_team_policy(&project, &policy);
-                respond_team_result(req, result);
-            } else if let Some((project, profile)) = profile_policy_route(&path) {
+            if let Some((project, profile)) = profile_policy_route(&path) {
                 let result = delete_profile_policy(&project, &profile);
                 respond_json_result(req, result);
             } else {
@@ -745,34 +671,6 @@ fn respond_project_provision_result(
     respond_broker_project_result(req, result, "project_provision_failed")
 }
 
-fn respond_team_result<T: Serialize>(req: tiny_http::Request, result: Result<T>) {
-    match result {
-        Ok(value) => respond_json(req, StatusCode(200), &value),
-        Err(error) => {
-            let message = error.to_string();
-            let unlock_required = message.contains("unlock_required")
-                || message.contains("missing broker unlock session")
-                || message.contains("expired broker unlock session")
-                || message.contains("active broker session required");
-            respond_json(
-                req,
-                if unlock_required {
-                    StatusCode(423)
-                } else {
-                    StatusCode(500)
-                },
-                &json!({
-                    "error": if unlock_required { "unlock_required" } else { "team_policy_failed" },
-                    "status": if unlock_required { "unlock_required" } else { "error" },
-                    "unlockRequired": unlock_required,
-                    "message": message,
-                    "fixCommand": if unlock_required { "ward unlock --ttl 8h" } else { "" }
-                }),
-            );
-        }
-    }
-}
-
 fn respond_broker_project_result<T: Serialize>(
     req: tiny_http::Request,
     result: Result<T>,
@@ -905,12 +803,7 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 }
 
 fn is_dashboard_page_route(path: &str) -> bool {
-    path == "/"
-        || path == "/logs"
-        || path == "/team"
-        || path == "/cloud"
-        || project_logs_route(path).is_some()
-        || project_team_route(path).is_some()
+    path == "/" || path == "/logs" || project_logs_route(path).is_some()
 }
 
 fn project_logs_route(path: &str) -> Option<String> {
@@ -921,62 +814,10 @@ fn project_logs_route(path: &str) -> Option<String> {
     }
 }
 
-fn project_team_route(path: &str) -> Option<String> {
-    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["projects", project, "team"] => Some(url_decode(project)),
-        _ => None,
-    }
-}
-
 fn store_snapshot_route(path: &str) -> Option<String> {
     let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
     match parts.as_slice() {
         ["api", "store", "projects", project, "snapshot"] => Some(url_decode(project)),
-        _ => None,
-    }
-}
-
-fn team_project_route(path: &str) -> Option<String> {
-    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["api", "teams", "projects", project] => Some(url_decode(project)),
-        _ => None,
-    }
-}
-
-fn team_members_collection_route(path: &str) -> Option<String> {
-    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["api", "teams", "projects", project, "members"] => Some(url_decode(project)),
-        _ => None,
-    }
-}
-
-fn team_member_route(path: &str) -> Option<(String, String)> {
-    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["api", "teams", "projects", project, "members", member] => {
-            Some((url_decode(project), url_decode(member)))
-        }
-        _ => None,
-    }
-}
-
-fn team_policies_collection_route(path: &str) -> Option<String> {
-    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["api", "teams", "projects", project, "policies"] => Some(url_decode(project)),
-        _ => None,
-    }
-}
-
-fn team_policy_route(path: &str) -> Option<(String, String)> {
-    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["api", "teams", "projects", project, "policies", policy] => {
-            Some((url_decode(project), url_decode(policy)))
-        }
         _ => None,
     }
 }
@@ -1197,170 +1038,6 @@ fn remove_project_from_dashboard(
         requested.export_path,
         requested.restore_env,
     )
-}
-
-fn team_view(project: &str) -> Result<teams::TeamRecord> {
-    registered_project(project)?;
-    teams::load_or_default(project)
-}
-
-fn create_team_member(project: &str, req: &mut tiny_http::Request) -> Result<teams::TeamRecord> {
-    let requested: TeamMemberRequest = read_json_body(req)?;
-    mutate_team(project, |record, _registered| {
-        teams::upsert_member(
-            record,
-            teams::TeamMemberInput {
-                id: requested.id,
-                name: requested.name,
-                role: requested.role,
-                agents: requested.agents,
-            },
-            None,
-        )
-    })
-}
-
-fn update_team_member(
-    project: &str,
-    member: &str,
-    req: &mut tiny_http::Request,
-) -> Result<teams::TeamRecord> {
-    let requested: TeamMemberRequest = read_json_body(req)?;
-    mutate_team(project, |record, _registered| {
-        teams::upsert_member(
-            record,
-            teams::TeamMemberInput {
-                id: requested.id,
-                name: requested.name,
-                role: requested.role,
-                agents: requested.agents,
-            },
-            Some(member),
-        )
-    })
-}
-
-fn delete_team_member(project: &str, member: &str) -> Result<teams::TeamRecord> {
-    mutate_team(project, |record, _registered| {
-        teams::remove_member(record, member)
-    })
-}
-
-fn create_team_policy(project: &str, req: &mut tiny_http::Request) -> Result<teams::TeamRecord> {
-    let requested: TeamPolicyRequest = read_json_body(req)?;
-    mutate_team_policy(project, None, requested)
-}
-
-fn update_team_policy(
-    project: &str,
-    policy: &str,
-    req: &mut tiny_http::Request,
-) -> Result<teams::TeamRecord> {
-    let requested: TeamPolicyRequest = read_json_body(req)?;
-    mutate_team_policy(project, Some(policy), requested)
-}
-
-fn delete_team_policy(project: &str, policy: &str) -> Result<teams::TeamRecord> {
-    mutate_team(project, |record, registered| {
-        let previous = record.clone();
-        teams::remove_policy(record, policy)?;
-        apply_team_policies_to_project(project, registered, &previous, record)
-    })
-}
-
-fn mutate_team_policy(
-    project: &str,
-    existing_name: Option<&str>,
-    requested: TeamPolicyRequest,
-) -> Result<teams::TeamRecord> {
-    mutate_team(project, |record, registered| {
-        let previous = record.clone();
-        teams::upsert_policy(
-            record,
-            teams::TeamPolicyInput {
-                name: requested.name,
-                member_id: requested.member_id,
-                agents: requested.agents,
-                profiles: requested.profiles,
-                env: requested.env,
-            },
-            existing_name,
-        )?;
-        apply_team_policies_to_project(project, registered, &previous, record)
-    })
-}
-
-fn mutate_team(
-    project: &str,
-    mutate: impl FnOnce(&mut teams::TeamRecord, &RegisteredProject) -> Result<()>,
-) -> Result<teams::TeamRecord> {
-    let registered = registered_project(project)?;
-    ensure_active_project_session(project, &registered)?;
-    let mut record = teams::load_or_default(project)?;
-    let actor = teams::current_member_id();
-    if !teams::can_manage(&record, &actor) {
-        anyhow::bail!("team member {actor} is not allowed to manage project policies");
-    }
-    mutate(&mut record, &registered)?;
-    teams::write_record(&record)?;
-    Ok(record)
-}
-
-fn apply_team_policies_to_project(
-    project: &str,
-    registered: &RegisteredProject,
-    previous: &teams::TeamRecord,
-    next: &teams::TeamRecord,
-) -> Result<()> {
-    let mut cfg = config::read_project_config(&registered.path)?;
-    let mut managed_agents = teams::policy_agents(previous);
-    managed_agents.extend(teams::policy_agents(next));
-    for agent in managed_agents {
-        cfg.agent_policies.remove(&agent);
-    }
-    for policy in next.policies.values() {
-        for profile in &policy.profiles {
-            if !cfg.profiles.contains_key(profile) {
-                anyhow::bail!("profile {profile} does not exist in project {project}");
-            }
-        }
-        for agent in &policy.agents {
-            cfg.agent_policies.insert(
-                agent.clone(),
-                config::AgentPolicyConfig {
-                    profiles: policy.profiles.clone(),
-                    env: policy.env.clone(),
-                },
-            );
-        }
-    }
-    config::write_project_config(&registered.path, &cfg, true)?;
-    Ok(())
-}
-
-fn ensure_active_project_session(project: &str, registered: &RegisteredProject) -> Result<()> {
-    let status = broker::status().map_err(|err| {
-        anyhow::anyhow!(
-            "unlock_required: active broker session required to update team policies ({err})"
-        )
-    })?;
-    let active = status
-        .sessions
-        .iter()
-        .any(|session| session.project == project && same_path(&session.vault, &registered.vault));
-    if !active {
-        anyhow::bail!("unlock_required: active broker session required to update team policies");
-    }
-    Ok(())
-}
-
-fn registered_project(project: &str) -> Result<RegisteredProject> {
-    let registry = registry::list_projects()?;
-    registry
-        .projects
-        .get(project)
-        .cloned()
-        .with_context(|| format!("project {project} is not registered"))
 }
 
 fn update_profile_env(
@@ -1645,7 +1322,6 @@ fn provision_project_from_dashboard(
         profiles: requested.profiles,
         env_names: requested.env,
         agents: requested.agents,
-        members: requested.members,
     })?;
     Ok(status)
 }
@@ -1704,59 +1380,7 @@ fn dashboard_status() -> Result<DashboardStatus> {
         instances: running_instances()?,
         broker: broker::status()?,
         human: human_runtime_view(),
-        cloud: cloud::dashboard_status()?,
     })
-}
-
-fn cloud_dashboard_view() -> Result<CloudDashboardView> {
-    let status = cloud::dashboard_status()?;
-    let teams = if status.db_exists {
-        cloud::list_teams(&cloud::default_db_path())?
-    } else {
-        Vec::new()
-    };
-    let catalog = cloud_catalog_option()?;
-    let auth_required = catalog.is_none();
-    let audit = if status.db_exists {
-        cloud::list_audit_events(&cloud::default_db_path(), None)?
-    } else {
-        Vec::new()
-    };
-    Ok(CloudDashboardView {
-        status,
-        teams,
-        catalog,
-        audit,
-        auth_required,
-    })
-}
-
-fn cloud_catalog_view() -> Result<Value> {
-    Ok(match cloud_catalog_option()? {
-        Some(catalog) => json!({
-            "authenticated": true,
-            "catalog": catalog,
-        }),
-        None => json!({
-            "authenticated": false,
-            "catalog": null,
-            "fixCommand": format!("ward auth login --cloud-url {}", cloud::default_cloud_url()),
-        }),
-    })
-}
-
-fn cloud_catalog_option() -> Result<Option<cloud::CloudCatalog>> {
-    let Ok(auth) = cloud::load_any_auth_session() else {
-        return Ok(None);
-    };
-    if !cloud::default_db_path().is_file() {
-        return Ok(None);
-    }
-    Ok(Some(cloud::catalog(
-        &cloud::default_db_path(),
-        &auth.account_email,
-        &auth.device_id,
-    )?))
 }
 
 fn dashboard_projects() -> Result<Vec<ProjectView>> {
@@ -1872,7 +1496,6 @@ fn project_view(
         broker_session_active,
         broker_session_expires_at,
         store_snapshot: project_store::show_summary(name).ok(),
-        team: teams::summary(name)?,
     })
 }
 
@@ -1972,7 +1595,6 @@ fn discovered_project_view(
         broker_session_active,
         broker_session_expires_at,
         store_snapshot: None,
-        team: teams::summary(&package.project_name)?,
     })
 }
 
@@ -2851,32 +2473,12 @@ mod tests {
             store_snapshot_route("/api/store/projects/demo/snapshot"),
             Some("demo".to_string())
         );
-        assert_eq!(
-            team_project_route("/api/teams/projects/demo"),
-            Some("demo".to_string())
-        );
-        assert_eq!(
-            team_members_collection_route("/api/teams/projects/demo/members"),
-            Some("demo".to_string())
-        );
-        assert_eq!(
-            team_member_route("/api/teams/projects/demo/members/local-user"),
-            Some(("demo".to_string(), "local-user".to_string()))
-        );
-        assert_eq!(
-            team_policies_collection_route("/api/teams/projects/demo/policies"),
-            Some("demo".to_string())
-        );
-        assert_eq!(
-            team_policy_route("/api/teams/projects/demo/policies/codex-dev"),
-            Some(("demo".to_string(), "codex-dev".to_string()))
-        );
         assert!(is_dashboard_page_route("/"));
         assert!(is_dashboard_page_route("/logs"));
-        assert!(is_dashboard_page_route("/team"));
-        assert!(is_dashboard_page_route("/cloud"));
         assert!(is_dashboard_page_route("/projects/demo/logs"));
-        assert!(is_dashboard_page_route("/projects/demo/team"));
+        assert!(!is_dashboard_page_route("/team"));
+        assert!(!is_dashboard_page_route("/cloud"));
+        assert!(!is_dashboard_page_route("/projects/demo/team"));
         assert!(profile_env_route("/api/projects/demo").is_none());
         let request_id = uuid::Uuid::new_v4();
         assert_eq!(
@@ -2920,14 +2522,14 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("openProjectLogs"));
         assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
         assert!(DASHBOARD_HTML.contains("notifications-btn"));
-        assert!(DASHBOARD_HTML.contains("id=\"team-link\""));
-        assert!(DASHBOARD_HTML.contains("id=\"cloud-link\""));
-        assert!(DASHBOARD_HTML.contains("renderCloud"));
-        assert!(DASHBOARD_HTML.contains("/api/cloud"));
-        assert!(DASHBOARD_HTML.contains("/api/teams/projects/"));
-        assert!(DASHBOARD_HTML.contains("renderTeam"));
-        assert!(DASHBOARD_HTML.contains("data-save-team-policy"));
-        assert!(DASHBOARD_HTML.contains("data-save-member"));
+        assert!(!DASHBOARD_HTML.contains("id=\"team-link\""));
+        assert!(!DASHBOARD_HTML.contains("id=\"cloud-link\""));
+        assert!(!DASHBOARD_HTML.contains("renderCloud"));
+        assert!(!DASHBOARD_HTML.contains("/api/cloud"));
+        assert!(!DASHBOARD_HTML.contains("/api/teams/projects/"));
+        assert!(!DASHBOARD_HTML.contains("renderTeam"));
+        assert!(!DASHBOARD_HTML.contains("data-save-team-policy"));
+        assert!(!DASHBOARD_HTML.contains("data-save-member"));
         assert!(DASHBOARD_HTML.contains("/api/notifications/stream"));
         assert!(DASHBOARD_HTML.contains("/api/approvals/"));
         assert!(DASHBOARD_HTML.contains("/api/worktrees/"));
@@ -3056,127 +2658,6 @@ mod tests {
 
         let deleted = delete_profile_policy("demo", "prod").unwrap();
         assert!(deleted.profiles.is_empty());
-    }
-
-    #[test]
-    #[serial]
-    fn team_view_returns_default_record_without_secret_values() {
-        let home = tempfile::tempdir().unwrap();
-        let _guard = WardHomeGuard::set(home.path());
-        let project = tempfile::tempdir().unwrap();
-        let cfg = config::ProjectConfig::default_for_dir(project.path(), Some("demo".to_string()))
-            .unwrap();
-        config::write_project_config(project.path(), &cfg, true).unwrap();
-        registry::register_project(
-            "demo".to_string(),
-            project.path().to_path_buf(),
-            project.path().join(".env.vault"),
-        )
-        .unwrap();
-
-        let team = team_view("demo").unwrap();
-        assert_eq!(team.project, "demo");
-        assert_eq!(team.members.len(), 1);
-        let serialized = serde_json::to_string(&team).unwrap();
-        assert!(serialized.contains(&teams::current_member_id()));
-        assert!(!serialized.contains("super-secret-value"));
-    }
-
-    #[test]
-    #[serial]
-    fn team_policy_mutation_requires_active_broker_session() {
-        let home = tempfile::tempdir().unwrap();
-        let _guard = WardHomeGuard::set(home.path());
-        let project = tempfile::tempdir().unwrap();
-        let cfg = config::ProjectConfig::default_for_dir(project.path(), Some("demo".to_string()))
-            .unwrap();
-        config::write_project_config(project.path(), &cfg, true).unwrap();
-        registry::register_project(
-            "demo".to_string(),
-            project.path().to_path_buf(),
-            project.path().join(".env.vault"),
-        )
-        .unwrap();
-
-        let err = mutate_team_policy(
-            "demo",
-            None,
-            TeamPolicyRequest {
-                name: "codex-dev".to_string(),
-                member_id: None,
-                agents: vec!["codex".to_string()],
-                profiles: vec!["dev".to_string()],
-                env: vec!["API_KEY".to_string()],
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("unlock_required"));
-    }
-
-    #[test]
-    #[serial]
-    fn applying_team_policy_updates_agent_policy_config() {
-        let home = tempfile::tempdir().unwrap();
-        let _guard = WardHomeGuard::set(home.path());
-        let project = tempfile::tempdir().unwrap();
-        let mut cfg =
-            config::ProjectConfig::default_for_dir(project.path(), Some("demo".to_string()))
-                .unwrap();
-        cfg.agent_policies.insert(
-            "old-agent".to_string(),
-            config::AgentPolicyConfig {
-                profiles: vec!["dev".to_string()],
-                env: vec!["OLD_SECRET".to_string()],
-            },
-        );
-        config::write_project_config(project.path(), &cfg, true).unwrap();
-        let registered = registry::register_project(
-            "demo".to_string(),
-            project.path().to_path_buf(),
-            project.path().join(".env.vault"),
-        )
-        .unwrap();
-
-        let mut previous = teams::default_record("demo");
-        teams::upsert_policy(
-            &mut previous,
-            teams::TeamPolicyInput {
-                name: "old-policy".to_string(),
-                member_id: None,
-                agents: vec!["old-agent".to_string()],
-                profiles: vec!["dev".to_string()],
-                env: vec!["OLD_SECRET".to_string()],
-            },
-            None,
-        )
-        .unwrap();
-        let mut next = teams::default_record("demo");
-        teams::upsert_policy(
-            &mut next,
-            teams::TeamPolicyInput {
-                name: "codex-dev".to_string(),
-                member_id: None,
-                agents: vec!["codex".to_string()],
-                profiles: vec!["dev".to_string()],
-                env: vec!["API_KEY".to_string()],
-            },
-            None,
-        )
-        .unwrap();
-
-        apply_team_policies_to_project("demo", &registered, &previous, &next).unwrap();
-
-        let updated = config::read_project_config(project.path()).unwrap();
-        assert!(!updated.agent_policies.contains_key("old-agent"));
-        assert_eq!(
-            updated.agent_policies["codex"].profiles,
-            vec!["dev".to_string()]
-        );
-        assert_eq!(
-            updated.agent_policies["codex"].env,
-            vec!["API_KEY".to_string()]
-        );
     }
 
     #[test]

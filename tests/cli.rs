@@ -4263,7 +4263,6 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     .unwrap();
     dispatch(Cli {
         command: Commands::Setup {
-            command: None,
             yes: true,
             project: Some("kept".to_string()),
             source: ".env".into(),
@@ -4292,7 +4291,6 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
 
     dispatch(Cli {
         command: Commands::Setup {
-            command: None,
             yes: true,
             project: Some("demo".to_string()),
             source: ".env".into(),
