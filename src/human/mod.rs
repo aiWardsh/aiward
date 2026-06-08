@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{broker, fs_util, term, workspace_target};
+use crate::{broker, config, fs_util, term, workspace_target};
 use base64::Engine as _;
 
 const HUMAN_ACTIVATION_BODY: &str =
@@ -248,24 +248,12 @@ pub fn activate_human_mode(
     all: bool,
     ttl: &str,
 ) -> Result<()> {
-    use crate::{config, logs::LogKind, registry, unlock, vault};
+    use crate::{logs::LogKind, registry, unlock, vault};
 
     let cwd = std::env::current_dir()?;
     let selector = workspace_target::TargetSelector { project, app, all };
-    let (header_project, header_path) = config::find_project_root(&cwd)
-        .and_then(|root| {
-            config::read_project_config(&root)
-                .ok()
-                .map(|cfg| (cfg.project, root))
-        })
-        .unwrap_or_else(|| {
-            let project = cwd
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("project")
-                .to_string();
-            (project, cwd.clone())
-        });
+    let selector = resolve_human_selector(selector, &cwd)?;
+    let (header_project, header_path) = human_header_context(&selector, &cwd);
     term::guided_header(
         "human",
         &header_project,
@@ -273,7 +261,6 @@ pub fn activate_human_mode(
         HUMAN_ACTIVATION_BODY,
     );
 
-    let selector = resolve_human_selector(selector, &cwd)?;
     let passphrase = vault::read_existing_passphrase()?;
     let targets = workspace_target::resolve_many_with_passphrase(&selector, &cwd, &passphrase)?;
     let duration = unlock::parse_ttl(ttl)?;
@@ -409,6 +396,36 @@ pub fn activate_human_mode(
     )?;
 
     Ok(())
+}
+
+fn human_header_context(
+    selector: &workspace_target::TargetSelector,
+    cwd: &std::path::Path,
+) -> (String, PathBuf) {
+    if let Ok(targets) = workspace_target::resolve_many(selector, cwd) {
+        if targets.len() == 1 {
+            let target = &targets[0];
+            return (target.name.clone(), target.path.clone());
+        }
+        if let Some(target) = targets.first() {
+            if let (Some(name), Some(root)) = (&target.workspace_name, &target.workspace_root) {
+                return (format!("{name} workspace"), root.clone());
+            }
+        }
+    }
+
+    if let Some(root) = config::find_project_root(cwd) {
+        if let Ok(cfg) = config::read_project_config(&root) {
+            return (cfg.project, root);
+        }
+    }
+
+    let project = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project")
+        .to_string();
+    (project, cwd.to_path_buf())
 }
 
 fn resolve_human_selector(

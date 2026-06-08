@@ -150,9 +150,22 @@ pub fn config_path(cwd: &Path) -> PathBuf {
 }
 
 pub fn find_project_root(cwd: &Path) -> Option<PathBuf> {
-    cwd.ancestors()
-        .find(|dir| config_path(dir).is_file())
-        .map(Path::to_path_buf)
+    for dir in cwd.ancestors() {
+        if config_path(dir).is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if is_project_search_boundary(dir) {
+            return None;
+        }
+    }
+    None
+}
+
+fn is_project_search_boundary(dir: &Path) -> bool {
+    dir.join(".git").exists()
+        || dir.join("pnpm-workspace.yaml").is_file()
+        || dir.join("turbo.json").is_file()
+        || package_json_has_workspaces(dir)
 }
 
 pub fn read_project_config(cwd: &Path) -> Result<ProjectConfig> {
@@ -770,6 +783,28 @@ fn package_manager_from_package_json(cwd: &Path) -> Option<String> {
         .map(|candidate| (*candidate).to_string())
 }
 
+fn package_json_has_workspaces(cwd: &Path) -> bool {
+    let Ok(path) =
+        fs_util::resolve_project_path(cwd, Path::new("package.json"), "package metadata")
+    else {
+        return false;
+    };
+    let Ok(contents) = fs_util::read_file_to_string(&path, "package metadata") else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    match value.get("workspaces") {
+        Some(serde_json::Value::Array(values)) => !values.is_empty(),
+        Some(serde_json::Value::Object(map)) => map
+            .get("packages")
+            .and_then(|packages| packages.as_array())
+            .is_some_and(|values| !values.is_empty()),
+        _ => false,
+    }
+}
+
 fn append_gitignore_line(lines: &mut Vec<String>, expected: &str) {
     if !lines.iter().any(|line| {
         let trimmed = line.trim();
@@ -1115,6 +1150,48 @@ mod tests {
 
         let fallback = tempfile::tempdir().unwrap();
         assert_eq!(detected_commands(fallback.path()).dev, "pnpm dev");
+    }
+
+    #[test]
+    fn project_root_lookup_stops_at_workspace_and_git_boundaries() {
+        let home = tempfile::tempdir().unwrap();
+        let home_config =
+            ProjectConfig::default_for_dir(home.path(), Some("home-project".to_string())).unwrap();
+        write_project_config(home.path(), &home_config, true).unwrap();
+
+        let workspace = home.path().join("workspace");
+        let app = workspace.join("apps").join("site");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            workspace.join("pnpm-workspace.yaml"),
+            "packages:\n  - apps/*\n",
+        )
+        .unwrap();
+        assert_eq!(find_project_root(&workspace), None);
+        assert_eq!(find_project_root(&app), None);
+
+        let app_config =
+            ProjectConfig::default_for_dir(&app, Some("workspace:site".to_string())).unwrap();
+        write_project_config(&app, &app_config, true).unwrap();
+        assert_eq!(find_project_root(&app), Some(app.clone()));
+        assert_eq!(find_project_root(&app.join("src")), Some(app.clone()));
+
+        let git_repo = home.path().join("repo");
+        std::fs::create_dir_all(git_repo.join("src")).unwrap();
+        std::fs::create_dir(git_repo.join(".git")).unwrap();
+        assert_eq!(find_project_root(&git_repo.join("src")), None);
+
+        let package_workspace = home.path().join("package-workspace");
+        std::fs::create_dir_all(package_workspace.join("apps").join("api")).unwrap();
+        std::fs::write(
+            package_workspace.join("package.json"),
+            r#"{"workspaces":["apps/*"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_project_root(&package_workspace.join("apps").join("api")),
+            None
+        );
     }
 
     #[test]
