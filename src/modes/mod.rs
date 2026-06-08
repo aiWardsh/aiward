@@ -58,8 +58,7 @@ pub fn load_local_modes(project_root: &Path) -> Result<Vec<ModeConfig>> {
     if !path.exists() {
         return Ok(vec![]);
     }
-    let content =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let content = fs_util::read_file_to_string(&path, "local modes")?;
     let modes: Vec<ModeConfig> =
         serde_json::from_str(&content).context("failed to parse .ward.modes.json")?;
     Ok(modes)
@@ -84,7 +83,7 @@ pub fn push_modes(
 
     // Store checksum of the local file for drift detection
     if local_path.exists() {
-        let content = fs::read(local_path)?;
+        let content = fs_util::read_file(local_path, "local modes file")?;
         let checksum = hex::encode(Sha256::digest(&content));
         fs::write(broker_modes_checksum_path(project), checksum)?;
     }
@@ -97,8 +96,7 @@ pub fn load_broker_modes(project: &str, passphrase: &str) -> Result<Vec<ModeConf
     if !vault_path.exists() {
         return Ok(vec![]);
     }
-    let vault_json = fs::read_to_string(&vault_path)
-        .with_context(|| format!("failed to read {}", vault_path.display()))?;
+    let vault_json = fs_util::read_file_to_string(&vault_path, "broker modes vault")?;
     let envelope: vault::VaultEnvelope =
         serde_json::from_str(&vault_json).context("failed to parse modes vault")?;
     let plaintext = vault::decrypt_env(&envelope, passphrase)
@@ -135,10 +133,10 @@ pub fn check_local_drift(project: &str, local_path: &Path) -> bool {
     if !checksum_path.exists() || !local_path.exists() {
         return false;
     }
-    let Ok(stored) = fs::read_to_string(&checksum_path) else {
+    let Ok(stored) = fs_util::read_file_to_string(&checksum_path, "broker modes checksum") else {
         return false;
     };
-    let Ok(content) = fs::read(local_path) else {
+    let Ok(content) = fs_util::read_file(local_path, "local modes file") else {
         return false;
     };
     let current = hex::encode(Sha256::digest(&content));

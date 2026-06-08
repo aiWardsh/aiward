@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fs,
     io::Cursor,
     path::{Path, PathBuf},
 };
@@ -75,8 +74,7 @@ pub fn export_env_file_with_key(
 }
 
 pub fn lock_plaintext_source(source: &Path, vault_path: &Path, passphrase: &str) -> Result<()> {
-    let plaintext =
-        fs::read_to_string(source).context(format!("failed to read {}", source.display()))?;
+    let plaintext = fs_util::read_file_to_string(source, "dotenv source")?;
     let plaintext = strip_ward_unlocked_header(&plaintext);
     if is_locked_env_contents(&plaintext) {
         anyhow::bail!(
@@ -135,8 +133,7 @@ pub fn inspect_env_file(env_path: &Path, vault_path: &Path) -> Result<EnvFileSta
     if !env_path.exists() {
         return Ok(EnvFileState::Missing);
     }
-    let contents =
-        fs::read_to_string(env_path).context(format!("failed to read {}", env_path.display()))?;
+    let contents = fs_util::read_file_to_string(env_path, "dotenv file")?;
     if !contents.starts_with(LOCKED_MARKER) {
         return Ok(EnvFileState::Plaintext);
     }
@@ -155,8 +152,7 @@ pub fn is_locked_env_file(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    let contents =
-        fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(path, "locked env file")?;
     Ok(is_locked_env_contents(&contents))
 }
 
@@ -182,7 +178,7 @@ WARD_VAULT={vault}
 }
 
 pub fn vault_hash(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).context(format!("failed to read {}", path.display()))?;
+    let bytes = fs_util::read_file(path, "vault hash source")?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(hex::encode(hasher.finalize()))

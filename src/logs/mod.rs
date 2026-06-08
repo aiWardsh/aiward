@@ -1,5 +1,4 @@
 use std::{
-    fs,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -289,11 +288,11 @@ fn last_entry(path: &Path) -> Result<Option<EncryptedLogEntry>> {
 }
 
 fn read_entries(path: &Path) -> Result<Vec<EncryptedLogEntry>> {
+    fs_util::reject_parent_traversal(path, "encrypted log path")?;
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let contents =
-        fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(path, "encrypted log")?;
     contents
         .lines()
         .enumerate()
@@ -321,8 +320,7 @@ struct LogKeyFile {
 fn log_key() -> Result<[u8; KEY_LEN]> {
     let path = log_key_path();
     if path.exists() {
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+        let contents = fs_util::read_file_to_string(&path, "log key")?;
         let stored: LogKeyFile = serde_json::from_str(&contents)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         if stored.version != 1 {

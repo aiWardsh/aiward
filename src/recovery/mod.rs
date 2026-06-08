@@ -180,8 +180,7 @@ pub fn import_recovery_file(source: &std::path::Path) -> Result<PathBuf> {
         .into_owned();
 
     let dest = dir.join(&filename);
-    let contents =
-        std::fs::read(&source).context(format!("failed to read {}", source.display()))?;
+    let contents = fs_util::read_file(&source, "recovery source")?;
     fs_util::write_private_file(&dest, &contents)?;
     Ok(dest)
 }
@@ -202,8 +201,7 @@ pub fn export_recovery_file(
         source.display()
     );
 
-    let contents =
-        std::fs::read(&source).context(format!("failed to read {}", source.display()))?;
+    let contents = fs_util::read_file(&source, "recovery file")?;
 
     let requested_out = if dest.is_dir() {
         dest.join(&filename)
@@ -225,8 +223,7 @@ pub fn recovery_file_exists(project: &str, passphrase: &str) -> bool {
 }
 
 fn decrypt_recovery_file(path: &std::path::Path, pin: &str) -> Result<String> {
-    let contents =
-        std::fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(path, "recovery file")?;
     let envelope: vault::VaultEnvelope =
         serde_json::from_str(&contents).context(format!("failed to parse {}", path.display()))?;
     vault::decrypt_env(&envelope, pin)

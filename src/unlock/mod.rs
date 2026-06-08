@@ -367,8 +367,7 @@ fn load_state(path: &Path) -> Result<UnlockState> {
     if !path.exists() {
         return Ok(UnlockState::default());
     }
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(path, "unlock metadata")?;
     serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 

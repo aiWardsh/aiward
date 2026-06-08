@@ -62,7 +62,8 @@ pub fn teardown_project(request: ProjectTeardownRequest) -> Result<ProjectTeardo
     }
 
     env_file::export_env_file_with_key(&output, &request.vault, &request.decrypt_key, true)?;
-    vault::validate_dotenv(&fs::read_to_string(&output)?)?;
+    let exported = fs_util::read_file_to_string(&output, "teardown export")?;
+    vault::validate_dotenv(&exported)?;
 
     let mut removed_files = Vec::new();
     for path in [
@@ -151,8 +152,7 @@ pub(crate) fn remove_agent_instruction_section(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    let contents =
-        fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(path, "agent instructions")?;
     let Some(index) = contents.find(config::AGENT_INSTRUCTIONS_MARKER) else {
         return Ok(false);
     };

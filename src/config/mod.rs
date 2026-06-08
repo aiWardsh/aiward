@@ -157,8 +157,7 @@ pub fn find_project_root(cwd: &Path) -> Option<PathBuf> {
 
 pub fn read_project_config(cwd: &Path) -> Result<ProjectConfig> {
     let path = config_path(cwd);
-    let contents =
-        fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(&path, "project config")?;
     let mut config: ProjectConfig =
         serde_json::from_str(&contents).context(format!("failed to parse {}", path.display()))?;
     // Backward compat: populate nonce for legacy configs that have none.
@@ -199,8 +198,7 @@ pub fn config_backup_path(project: &str) -> PathBuf {
 
 pub fn read_project_config_backup(project: &str) -> Result<ProjectConfigBackup> {
     let path = config_backup_path(project);
-    let contents =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(&path, "project config backup")?;
     serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
@@ -218,7 +216,7 @@ pub fn find_project_config_backup_for_path(
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let Ok(contents) = fs::read_to_string(&path) else {
+        let Ok(contents) = fs_util::read_file_to_string(&path, "project config backup") else {
             continue;
         };
         let Ok(backup) = serde_json::from_str::<ProjectConfigBackup>(&contents) else {
@@ -380,9 +378,9 @@ pub fn replace_default_profiles(config: &mut ProjectConfig, env_keys: &[String],
 }
 
 pub fn ensure_gitignore(cwd: &Path, commit_vault: bool) -> Result<PathBuf> {
-    let path = cwd.join(".gitignore");
+    let path = fs_util::resolve_project_path(cwd, Path::new(".gitignore"), ".gitignore path")?;
     let existing = if path.exists() {
-        fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?
+        fs_util::read_file_to_string(&path, ".gitignore")?
     } else {
         String::new()
     };
@@ -410,10 +408,9 @@ pub fn ensure_gitignore(cwd: &Path, commit_vault: bool) -> Result<PathBuf> {
 }
 
 pub fn ensure_env_example(cwd: &Path) -> Result<Option<PathBuf>> {
-    let path = cwd.join(".env.example");
+    let path = fs_util::resolve_project_path(cwd, Path::new(".env.example"), ".env.example path")?;
     if path.exists() {
-        let contents =
-            fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?;
+        let contents = fs_util::read_file_to_string(&path, ".env.example")?;
         if contents.contains("Ward managed environment") {
             return Ok(None);
         }
@@ -432,17 +429,24 @@ pub fn ensure_env_example(cwd: &Path) -> Result<Option<PathBuf>> {
 }
 
 pub fn ensure_agent_instructions(cwd: &Path, project: &str) -> Result<Option<PathBuf>> {
-    let claude_path = cwd.join(CLAUDE_INSTRUCTIONS_FILE);
+    let claude_path = fs_util::resolve_project_path(
+        cwd,
+        Path::new(CLAUDE_INSTRUCTIONS_FILE),
+        "Claude instructions path",
+    )?;
     let path = if claude_path.exists() {
         claude_path
     } else {
-        cwd.join(AGENT_INSTRUCTIONS_FILE)
+        fs_util::resolve_project_path(
+            cwd,
+            Path::new(AGENT_INSTRUCTIONS_FILE),
+            "agent instructions path",
+        )?
     };
     let section = agent_instructions_section(project);
 
     if path.exists() {
-        let contents =
-            fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?;
+        let contents = fs_util::read_file_to_string(&path, "agent instructions")?;
         if contents.contains(AGENT_INSTRUCTIONS_MARKER) {
             return Ok(None);
         }
@@ -755,8 +759,9 @@ fn detected_package_manager(cwd: &Path) -> Option<String> {
 }
 
 fn package_manager_from_package_json(cwd: &Path) -> Option<String> {
-    let path = cwd.join("package.json");
-    let contents = fs::read_to_string(path).ok()?;
+    let path =
+        fs_util::resolve_project_path(cwd, Path::new("package.json"), "package metadata").ok()?;
+    let contents = fs_util::read_file_to_string(&path, "package metadata").ok()?;
     let value = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
     let manager = value.get("packageManager")?.as_str()?;
     ["pnpm", "npm", "yarn", "bun"]

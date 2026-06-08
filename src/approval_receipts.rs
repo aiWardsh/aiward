@@ -277,8 +277,7 @@ pub fn canonical_payload_bytes(payload: &ApprovalReceiptPayload) -> Vec<u8> {
 
 fn read_project_key(project: &str) -> Result<ApprovalKeyFile> {
     let path = project_key_path(project);
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(&path, "approval key")?;
     let key_file = serde_json::from_str::<ApprovalKeyFile>(&contents)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     if key_file.version != 1 {

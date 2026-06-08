@@ -252,8 +252,7 @@ pub fn read_record(project: &str) -> Result<ProjectStoreRecord> {
 }
 
 fn read_record_path(path: &Path) -> Result<ProjectStoreRecord> {
-    let contents =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let contents = fs_util::read_file_to_string(path, "project store record")?;
     serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 

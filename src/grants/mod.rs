@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -280,16 +280,15 @@ pub fn consume_once_grant(id: uuid::Uuid) -> Result<bool> {
 }
 
 pub fn load_grants_from_path(path: &Path) -> Result<Vec<ApprovalGrant>> {
+    fs_util::reject_parent_traversal(path, "approval grants path")?;
     if !path.exists() {
         return Ok(Vec::new());
     }
 
-    let file = fs::File::open(path).context(format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let contents = fs_util::read_file_to_string(path, "approval grants")?;
     let mut grants = Vec::new();
 
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.context(format!("failed to read {}", path.display()))?;
+    for (index, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
@@ -311,6 +310,7 @@ pub fn load_grants_from_path(path: &Path) -> Result<Vec<ApprovalGrant>> {
 }
 
 pub fn append_grant_to_path(path: &Path, grant: &ApprovalGrant) -> Result<()> {
+    fs_util::reject_parent_traversal(path, "approval grants path")?;
     ensure_ward_home_for(path)?;
     let mut file = fs_util::open_private_append(path)?;
     let line = serde_json::to_string(grant).expect("approval grants should serialize");
@@ -370,6 +370,7 @@ pub fn prune_expired_grants_at_path(path: &Path, now: DateTime<Utc>) -> Result<u
 }
 
 fn write_grants_to_path(path: &Path, grants: &[ApprovalGrant]) -> Result<()> {
+    fs_util::reject_parent_traversal(path, "approval grants path")?;
     ensure_ward_home_for(path)?;
     fs_util::ensure_private_parent_dir(path)?;
     let mut file = fs::File::create(path).context(format!("failed to write {}", path.display()))?;

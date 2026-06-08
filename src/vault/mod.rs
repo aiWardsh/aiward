@@ -154,8 +154,7 @@ pub fn encrypt_raw_bytes(plaintext: &[u8], key: &[u8; KEY_LEN]) -> Result<VaultE
 }
 
 pub fn import_env_file(source: &Path, vault_path: &Path, passphrase: &str) -> Result<PathBuf> {
-    let plaintext =
-        fs::read_to_string(source).context(format!("failed to read {}", source.display()))?;
+    let plaintext = fs_util::read_file_to_string(source, "dotenv source")?;
     validate_dotenv(&plaintext)?;
 
     let envelope = encrypt_env(&plaintext, passphrase)?;
@@ -268,8 +267,7 @@ pub fn decrypt_env(envelope: &VaultEnvelope, passphrase: &str) -> Result<String>
 }
 
 pub fn read_vault(vault_path: &Path) -> Result<VaultEnvelope> {
-    let contents = fs::read_to_string(vault_path)
-        .context(format!("failed to read {}", vault_path.display()))?;
+    let contents = fs_util::read_file_to_string(vault_path, "vault file")?;
     serde_json::from_str(&contents).context(format!("failed to parse {}", vault_path.display()))
 }
 

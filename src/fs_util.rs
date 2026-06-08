@@ -66,6 +66,21 @@ pub(crate) fn resolve_existing_external_file(path: &Path, label: &str) -> Result
     Ok(resolved)
 }
 
+pub(crate) fn checked_existing_file(path: &Path, label: &str) -> Result<PathBuf> {
+    reject_parent_traversal(path, label)?;
+    resolve_existing_external_file(path, label)
+}
+
+pub(crate) fn read_file(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let resolved = checked_existing_file(path, label)?;
+    fs::read(&resolved).context(format!("failed to read {}", resolved.display()))
+}
+
+pub(crate) fn read_file_to_string(path: &Path, label: &str) -> Result<String> {
+    let resolved = checked_existing_file(path, label)?;
+    fs::read_to_string(&resolved).context(format!("failed to read {}", resolved.display()))
+}
+
 pub(crate) fn resolve_existing_external_dir(path: &Path, label: &str) -> Result<PathBuf> {
     let resolved = path
         .canonicalize()
@@ -76,10 +91,15 @@ pub(crate) fn resolve_existing_external_dir(path: &Path, label: &str) -> Result<
     Ok(resolved)
 }
 
-pub(crate) fn resolve_external_output(path: &Path, label: &str) -> Result<PathBuf> {
+pub(crate) fn reject_parent_traversal(path: &Path, label: &str) -> Result<()> {
     if has_parent_component(path) {
         anyhow::bail!("{label} must not contain parent directory traversal");
     }
+    Ok(())
+}
+
+pub(crate) fn resolve_external_output(path: &Path, label: &str) -> Result<PathBuf> {
+    reject_parent_traversal(path, label)?;
     let resolved = absolutize(path)?;
     if let Some(parent) = resolved.parent() {
         let parent_real = parent
@@ -96,9 +116,7 @@ pub(crate) fn resolve_external_output(path: &Path, label: &str) -> Result<PathBu
 }
 
 pub(crate) fn resolve_external_directory_output(path: &Path, label: &str) -> Result<PathBuf> {
-    if has_parent_component(path) {
-        anyhow::bail!("{label} must not contain parent directory traversal");
-    }
+    reject_parent_traversal(path, label)?;
     let resolved = absolutize(path)?;
     let existing = nearest_existing_path(&resolved);
     if let Ok(existing_real) = existing.canonicalize() {
@@ -337,5 +355,27 @@ mod tests {
             .to_string();
 
         assert!(error.contains("must stay inside"));
+    }
+
+    #[test]
+    fn checked_read_helpers_reject_parent_traversal() {
+        let error = read_file(Path::new("../outside.env"), "dotenv file")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("parent directory traversal"));
+    }
+
+    #[test]
+    fn checked_read_helpers_read_existing_files() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("state.json");
+        std::fs::write(&path, "{\"ok\":true}\n").unwrap();
+
+        assert_eq!(
+            read_file_to_string(&path, "state file").unwrap(),
+            "{\"ok\":true}\n"
+        );
+        assert_eq!(read_file(&path, "state file").unwrap(), b"{\"ok\":true}\n");
     }
 }
