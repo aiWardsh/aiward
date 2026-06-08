@@ -154,6 +154,13 @@ pub fn encrypt_raw_bytes(plaintext: &[u8], key: &[u8; KEY_LEN]) -> Result<VaultE
 }
 
 pub fn import_env_file(source: &Path, vault_path: &Path, passphrase: &str) -> Result<PathBuf> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if source
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", source.display());
+    }
     let plaintext =
         fs::read_to_string(source).context(format!("failed to read {}", source.display()))?;
     validate_dotenv(&plaintext)?;
@@ -268,6 +275,13 @@ pub fn decrypt_env(envelope: &VaultEnvelope, passphrase: &str) -> Result<String>
 }
 
 pub fn read_vault(vault_path: &Path) -> Result<VaultEnvelope> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if vault_path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", vault_path.display());
+    }
     let contents = fs::read_to_string(vault_path)
         .context(format!("failed to read {}", vault_path.display()))?;
     serde_json::from_str(&contents).context(format!("failed to parse {}", vault_path.display()))

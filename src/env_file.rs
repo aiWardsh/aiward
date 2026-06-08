@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Cursor,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -75,6 +75,10 @@ pub fn export_env_file_with_key(
 }
 
 pub fn lock_plaintext_source(source: &Path, vault_path: &Path, passphrase: &str) -> Result<()> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if source.components().any(|c| c == Component::ParentDir) {
+        anyhow::bail!("Invalid input: {}", source.display());
+    }
     let plaintext =
         fs::read_to_string(source).context(format!("failed to read {}", source.display()))?;
     let plaintext = strip_ward_unlocked_header(&plaintext);
@@ -155,6 +159,10 @@ pub fn is_locked_env_file(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path.components().any(|c| c == Component::ParentDir) {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let contents =
         fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
     Ok(is_locked_env_contents(&contents))
@@ -182,6 +190,10 @@ WARD_VAULT={vault}
 }
 
 pub fn vault_hash(path: &Path) -> Result<String> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path.components().any(|c| c == Component::ParentDir) {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let bytes = fs::read(path).context(format!("failed to read {}", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);

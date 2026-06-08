@@ -252,6 +252,13 @@ pub fn read_record(project: &str) -> Result<ProjectStoreRecord> {
 }
 
 fn read_record_path(path: &Path) -> Result<ProjectStoreRecord> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))

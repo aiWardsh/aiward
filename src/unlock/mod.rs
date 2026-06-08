@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -364,6 +364,10 @@ fn remove_expired(state: &mut UnlockState, now: DateTime<Utc>) -> Result<()> {
 }
 
 fn load_state(path: &Path) -> Result<UnlockState> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path.components().any(|c| c == Component::ParentDir) {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     if !path.exists() {
         return Ok(UnlockState::default());
     }

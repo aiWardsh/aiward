@@ -225,6 +225,13 @@ pub fn recovery_file_exists(project: &str, passphrase: &str) -> bool {
 }
 
 fn decrypt_recovery_file(path: &std::path::Path, pin: &str) -> Result<String> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
+    }
     let contents =
         std::fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
     let envelope: vault::VaultEnvelope =

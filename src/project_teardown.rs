@@ -62,6 +62,13 @@ pub fn teardown_project(request: ProjectTeardownRequest) -> Result<ProjectTeardo
     }
 
     env_file::export_env_file_with_key(&output, &request.vault, &request.decrypt_key, true)?;
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if output
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", output.display());
+    }
     vault::validate_dotenv(&fs::read_to_string(&output)?)?;
 
     let mut removed_files = Vec::new();
@@ -150,6 +157,13 @@ pub(crate) fn remove_project_file_if_exists(
 pub(crate) fn remove_agent_instruction_section(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
+    }
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("Invalid input: {}", path.display());
     }
     let contents =
         fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
