@@ -492,8 +492,6 @@
   <div class="header-right">
     <a class="btn" id="overview-link" href="/">overview</a>
     <a class="btn" id="logs-link" href="/logs">all logs</a>
-    <a class="btn" id="team-link" href="/team">team</a>
-    <a class="btn" id="cloud-link" href="/cloud">cloud</a>
     <button class="btn" id="add-project-btn">add project</button>
     <div class="notification-wrap" id="notification-wrap">
       <button class="btn notification-btn" id="notifications-btn" type="button">notifications<span class="notification-count" id="notification-count">0</span></button>
@@ -529,12 +527,9 @@
 const token = new URLSearchParams(location.search).get('token') || '';
 const currentPath = window.location.pathname;
 const logsProject = projectFromLogPath(currentPath);
-const teamProject = projectFromTeamPath(currentPath);
 let projects = [];
 let status = null;
 let events = [];
-let team = null;
-let cloud = null;
 let selectedProject = null;
 let selectedRow = null;
 let selectedEventKey = null;
@@ -581,17 +576,7 @@ function projectFromLogPath(path) {
   return null;
 }
 
-function projectFromTeamPath(path) {
-  const parts = path.split('/').filter(Boolean);
-  if (parts.length === 3 && parts[0] === 'projects' && parts[2] === 'team') {
-    return decodeURIComponent(parts[1]);
-  }
-  return null;
-}
-
 function isLogsPage() { return currentPath === '/logs' || logsProject; }
-function isTeamPage() { return currentPath === '/team' || teamProject; }
-function isCloudPage() { return currentPath === '/cloud'; }
 
 async function load() {
   [projects, status, notifications] = await Promise.all([
@@ -600,17 +585,11 @@ async function load() {
     api('/api/notifications')
   ]);
   if (!selectedProject && projects.length) {
-    selectedProject = logsProject || teamProject || (projects.find(p => p.active) || projects[0]).name;
+    selectedProject = logsProject || (projects.find(p => p.active) || projects[0]).name;
   }
   if (isLogsPage()) {
     await loadEvents(logsProject);
     renderLogs();
-  } else if (isTeamPage()) {
-    await loadTeam(selectedProject);
-    renderTeam();
-  } else if (isCloudPage()) {
-    await loadCloud();
-    renderCloud();
   } else {
     renderOverview();
   }
@@ -624,20 +603,10 @@ async function loadEvents(project) {
   events = await api(`/api/events${suffix}`);
 }
 
-async function loadTeam(project) {
-  team = project ? await api(`/api/teams/projects/${encodeURIComponent(project)}`) : null;
-}
-
-async function loadCloud() {
-  cloud = await api('/api/cloud');
-}
-
 function renderOverview() {
   document.getElementById('page-title').textContent = 'overview';
   document.getElementById('overview-link').href = link('/');
   document.getElementById('logs-link').href = link('/logs');
-  document.getElementById('team-link').href = link('/team');
-  document.getElementById('cloud-link').href = link('/cloud');
   renderProjectFilters();
   renderProjectTable();
   if (pendingProvision) {
@@ -666,7 +635,7 @@ function renderProjectFilters() {
 function renderProjectTable() {
   const table = document.getElementById('main-table');
   table.innerHTML = `<thead><tr>
-    <th>project</th><th>config</th><th>setup</th><th>session</th><th>store</th><th>team</th><th>env</th><th>profiles</th><th>agents</th>
+    <th>project</th><th>config</th><th>setup</th><th>session</th><th>store</th><th>env</th><th>profiles</th><th>agents</th>
   </tr></thead><tbody></tbody>`;
   const tbody = table.querySelector('tbody');
   projects.forEach((project, index) => {
@@ -678,7 +647,6 @@ function renderProjectTable() {
       <td>${statusBadge(project.setupStatus === 'configured' || project.configStatus === 'ok', project.setupStatus || 'configured')}</td>
       <td>${statusBadge(project.brokerSessionActive, project.brokerSessionActive ? 'active' : 'locked')}</td>
       <td>${statusBadge(Boolean(project.storeSnapshot), project.storeSnapshot ? (project.storeSnapshot.stale ? 'stale' : 'stored') : 'missing')}</td>
-      <td>${project.team ? `${project.team.memberCount}/${project.team.policyCount}` : '0/0'}</td>
       <td>${project.envNames.length}</td>
       <td>${project.profiles.length}</td>
       <td>${(project.agentPolicies || []).length}</td>`;
@@ -722,7 +690,6 @@ function renderProjectDetail(project) {
       <span class="badge ${project.brokerSessionActive ? 'badge-ok' : 'badge-warn'}">${project.brokerSessionActive ? 'active' : 'locked'}</span>
       <span class="detail-title">${esc(project.name)}</span>
       <a class="btn detail-ts" href="${link(`/projects/${encodeURIComponent(project.name)}/logs`)}">logs</a>
-      <a class="btn detail-ts" href="${link(`/projects/${encodeURIComponent(project.name)}/team`)}">team</a>
     </div>
     ${project.parentProject ? field('workspace', esc(project.parentProject)) : ''}
     ${project.packageName ? field('package', esc(project.packageName)) : ''}
@@ -732,7 +699,6 @@ function renderProjectDetail(project) {
     ${field('setup', project.setupStatus || 'configured')}
     ${field('session', project.brokerSessionActive ? `active until ${esc(formatDateTime(project.brokerSessionExpiresAt))}` : 'locked')}
     ${field('project store', project.storeSnapshot ? `${project.storeSnapshot.stale ? 'stale' : 'ready'} · ${esc(project.storeSnapshot.updatedAt)}` : 'missing')}
-    ${field('team', project.team ? `${project.team.memberCount} member(s), ${project.team.policyCount} policy(s), ${project.team.agentCount} agent(s)` : 'missing')}
     <div class="inline-form">
       <button class="btn" data-lock-project="${esc(project.name)}">lock project</button>
       <button class="btn" data-lock-all>lock all</button>
@@ -853,321 +819,6 @@ function profilePayload(editor) {
   };
 }
 
-function renderTeam() {
-  const project = currentProject();
-  document.getElementById('page-title').textContent = project ? `${project.name} team` : 'team';
-  document.getElementById('overview-link').href = link('/');
-  document.getElementById('logs-link').href = link(project ? `/projects/${encodeURIComponent(project.name)}/logs` : '/logs');
-  document.getElementById('team-link').href = link('/team');
-  document.getElementById('cloud-link').href = link('/cloud');
-  renderTeamFilters();
-  renderTeamTable();
-  renderTeamDetail(project);
-}
-
-function renderTeamFilters() {
-  const filters = document.getElementById('filters');
-  filters.innerHTML = '<span class="filter-label">project</span>' + projects.map(p => (
-    `<button class="chip ${p.name === selectedProject ? 'active' : ''}" data-team-project="${esc(p.name)}">${esc(p.name)}</button>`
-  )).join('');
-  filters.querySelectorAll('[data-team-project]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      if (!confirmDiscardDrafts()) return;
-      selectedProject = btn.dataset.teamProject;
-      await loadTeam(selectedProject);
-      renderTeam();
-    });
-  });
-}
-
-function renderTeamTable() {
-  const table = document.getElementById('main-table');
-  table.innerHTML = `<thead><tr>
-    <th>project</th><th>members</th><th>policies</th><th>agents</th><th>session</th>
-  </tr></thead><tbody></tbody>`;
-  const tbody = table.querySelector('tbody');
-  projects.forEach(project => {
-    const tr = document.createElement('tr');
-    if (project.name === selectedProject) tr.classList.add('selected');
-    tr.innerHTML = `
-      <td><span class="badge ${project.active ? 'badge-ok' : 'badge-neutral'}">${esc(project.name)}</span></td>
-      <td>${project.team ? project.team.memberCount : 0}</td>
-      <td>${project.team ? project.team.policyCount : 0}</td>
-      <td>${project.team ? project.team.agentCount : 0}</td>
-      <td>${statusBadge(project.brokerSessionActive, project.brokerSessionActive ? 'active' : 'locked')}</td>`;
-    tr.addEventListener('click', async () => {
-      if (!confirmDiscardDrafts()) return;
-      selectedProject = project.name;
-      await loadTeam(selectedProject);
-      renderTeam();
-    });
-    tbody.appendChild(tr);
-  });
-  document.getElementById('item-count').textContent = `${projects.length} team project(s)`;
-  document.getElementById('filter-count').textContent = team ? `${Object.keys(team.members || {}).length} members · ${Object.keys(team.policies || {}).length} policies` : '';
-}
-
-function renderTeamDetail(project) {
-  const pane = document.getElementById('detail-pane');
-  if (!project || !team) {
-    pane.innerHTML = '<div class="detail-empty">select a project</div>';
-    return;
-  }
-  pane.innerHTML = `
-    <div class="detail-header">
-      <span class="badge ${project.brokerSessionActive ? 'badge-ok' : 'badge-warn'}">${project.brokerSessionActive ? 'active' : 'locked'}</span>
-      <span class="detail-title">${esc(project.name)} team</span>
-      <a class="btn detail-ts" href="${link(`/projects/${encodeURIComponent(project.name)}/logs`)}">logs</a>
-    </div>
-    ${field('policy source', 'local team simulator')}
-    ${field('members', String(Object.keys(team.members || {}).length))}
-    ${field('policies', String(Object.keys(team.policies || {}).length))}
-    <div class="field-group">
-      <div class="field-label">members</div>
-      <div id="team-members"></div>
-    </div>
-    <div class="field-group">
-      <div class="field-label">new member</div>
-      ${memberEditor(null)}
-    </div>
-    <div class="field-group">
-      <div class="field-label">agent env policies</div>
-      <div id="team-policies"></div>
-    </div>
-    <div class="field-group">
-      <div class="field-label">new policy</div>
-      ${teamPolicyEditor(project, null)}
-    </div>`;
-  renderMemberCards(project);
-  renderTeamPolicyCards(project);
-  bindTeamEditors(project);
-}
-
-function renderMemberCards(project) {
-  const host = document.getElementById('team-members');
-  const members = Object.values(team.members || {}).sort((a, b) => a.id.localeCompare(b.id));
-  host.innerHTML = members.map(member => `
-    <div class="policy-card">
-      <div class="policy-actions">
-        <span><span class="badge badge-neutral">${esc(member.id)}</span> ${esc(member.role)}</span>
-        <button class="btn danger" data-delete-member="${esc(member.id)}">delete</button>
-      </div>
-      ${memberEditor(member)}
-    </div>
-  `).join('') || '<div class="finding-msg">no members</div>';
-}
-
-function memberEditor(member) {
-  return `
-    <div class="form-grid" data-dirty-scope data-member-editor="${esc(member ? member.id : 'create')}">
-      <input data-field="id" placeholder="member id or email" value="${esc(member ? member.id : '')}">
-      ${dropdownMarkup('role', member ? member.role : 'developer', ['owner','admin','developer','viewer'])}
-      <input class="full" data-field="name" placeholder="display name" value="${esc(member ? member.name : '')}">
-      <input class="full" data-field="agents" placeholder="agent identities, comma separated" value="${esc(member ? (member.agents || []).join(', ') : '')}">
-      <div class="full inline-form">
-        <button class="btn primary" data-save-member="${esc(member ? member.id : '')}">${member ? 'save' : 'create'}</button>
-      </div>
-    </div>`;
-}
-
-function renderTeamPolicyCards(project) {
-  const host = document.getElementById('team-policies');
-  const policies = Object.values(team.policies || {}).sort((a, b) => a.name.localeCompare(b.name));
-  host.innerHTML = policies.map(policy => `
-    <div class="policy-card">
-      <div class="policy-actions">
-        <span><span class="badge badge-neutral">${esc(policy.name)}</span> ${(policy.agents || []).map(envChip).join('')}</span>
-        <button class="btn danger" data-delete-team-policy="${esc(policy.name)}">delete</button>
-      </div>
-      ${teamPolicyEditor(project, policy)}
-    </div>
-  `).join('') || '<div class="finding-msg">no team policies</div>';
-}
-
-function teamPolicyEditor(project, policy) {
-  const profiles = new Set(policy ? policy.profiles || [] : []);
-  const env = new Set(policy ? policy.env || [] : []);
-  const members = Object.values(team.members || {}).sort((a, b) => a.id.localeCompare(b.id));
-  return `
-    <div class="form-grid" data-dirty-scope data-team-policy-editor="${esc(policy ? policy.name : 'create')}">
-      <input data-field="name" placeholder="policy name" value="${esc(policy ? policy.name : '')}">
-      ${dropdownMarkup('memberId', policy && policy.memberId ? policy.memberId : '', [{ value: '', label: 'no member' }].concat(members.map(member => ({ value: member.id, label: member.id }))))}
-      <input class="full" data-field="agents" placeholder="agent identities, comma separated" value="${esc(policy ? (policy.agents || []).join(', ') : '')}">
-      <div class="field-label full">profiles</div>
-      <div class="full check-grid">
-        ${project.profiles.map(profile => `<label><input type="checkbox" data-policy-profile="${esc(profile.name)}" ${profiles.has(profile.name) ? 'checked' : ''}>${esc(profile.name)}</label>`).join('') || '<span class="sev-info">none</span>'}
-      </div>
-      <div class="field-label full">env names</div>
-      <div class="full check-grid">
-        ${project.envNames.map(name => `<label><input type="checkbox" data-policy-env="${esc(name)}" ${env.has(name) ? 'checked' : ''}>${esc(name)}</label>`).join('') || '<span class="sev-info">none</span>'}
-      </div>
-      <div class="full inline-form">
-        <button class="btn primary" data-save-team-policy="${esc(policy ? policy.name : '')}">${policy ? 'save' : 'create'}</button>
-      </div>
-    </div>`;
-}
-
-function bindTeamEditors(project) {
-  bindDropdowns(document.getElementById('detail-pane'));
-  bindDirtyTracking(document.getElementById('detail-pane'));
-  document.querySelectorAll('[data-save-member]').forEach(btn => {
-    btn.addEventListener('click', () => saveTeamMember(project.name, btn.dataset.saveMember, btn.closest('[data-member-editor]')));
-  });
-  document.querySelectorAll('[data-delete-member]').forEach(btn => {
-    btn.addEventListener('click', () => deleteTeamMember(project.name, btn.dataset.deleteMember));
-  });
-  document.querySelectorAll('[data-save-team-policy]').forEach(btn => {
-    btn.addEventListener('click', () => saveTeamPolicy(project.name, btn.dataset.saveTeamPolicy, btn.closest('[data-team-policy-editor]')));
-  });
-  document.querySelectorAll('[data-delete-team-policy]').forEach(btn => {
-    btn.addEventListener('click', () => deleteTeamPolicy(project.name, btn.dataset.deleteTeamPolicy));
-  });
-}
-
-async function saveTeamMember(projectName, oldId, editor) {
-  const body = {
-    id: editor.querySelector('[data-field="id"]').value.trim(),
-    name: editor.querySelector('[data-field="name"]').value.trim(),
-    role: editor.querySelector('[data-field="role"]').dataset.value,
-    agents: splitList(editor.querySelector('[data-field="agents"]').value)
-  };
-  const path = oldId
-    ? `/api/teams/projects/${encodeURIComponent(projectName)}/members/${encodeURIComponent(oldId)}`
-    : `/api/teams/projects/${encodeURIComponent(projectName)}/members`;
-  const method = oldId ? 'PATCH' : 'POST';
-  await mutateTeam(path, method, body, projectName);
-}
-
-async function deleteTeamMember(projectName, memberId) {
-  if (!confirmDiscardDrafts()) return;
-  await mutateTeam(`/api/teams/projects/${encodeURIComponent(projectName)}/members/${encodeURIComponent(memberId)}`, 'DELETE', null, projectName);
-}
-
-async function saveTeamPolicy(projectName, oldName, editor) {
-  const memberId = editor.querySelector('[data-field="memberId"]').dataset.value;
-  const body = {
-    name: editor.querySelector('[data-field="name"]').value.trim(),
-    memberId: memberId || null,
-    agents: splitList(editor.querySelector('[data-field="agents"]').value),
-    profiles: [...editor.querySelectorAll('[data-policy-profile]:checked')].map(input => input.dataset.policyProfile),
-    env: [...editor.querySelectorAll('[data-policy-env]:checked')].map(input => input.dataset.policyEnv)
-  };
-  const path = oldName
-    ? `/api/teams/projects/${encodeURIComponent(projectName)}/policies/${encodeURIComponent(oldName)}`
-    : `/api/teams/projects/${encodeURIComponent(projectName)}/policies`;
-  const method = oldName ? 'PATCH' : 'POST';
-  await mutateTeam(path, method, body, projectName);
-}
-
-async function deleteTeamPolicy(projectName, policyName) {
-  if (!confirmDiscardDrafts()) return;
-  await mutateTeam(`/api/teams/projects/${encodeURIComponent(projectName)}/policies/${encodeURIComponent(policyName)}`, 'DELETE', null, projectName);
-}
-
-async function mutateTeam(path, method, body, projectName) {
-  try {
-    team = await api(path, { method, body: body ? JSON.stringify(body) : undefined });
-    projects = await api('/api/projects');
-    selectedProject = projectName;
-    clearEditorDirty();
-    renderTeam();
-  } catch (error) {
-    alert(error.data && error.data.fixCommand ? `${error.message}\\n${error.data.fixCommand}` : error.message);
-  }
-}
-
-function renderCloud() {
-  const status = (cloud && cloud.status) || {};
-  const auth = status.auth || null;
-  const teams = (cloud && cloud.teams) || [];
-  const catalog = (cloud && cloud.catalog) || null;
-  const environments = (catalog && catalog.environments) || [];
-  const audit = (cloud && cloud.audit) || [];
-  document.getElementById('page-title').textContent = 'cloud';
-  document.getElementById('overview-link').href = link('/');
-  document.getElementById('logs-link').href = link('/logs');
-  document.getElementById('team-link').href = link('/team');
-  document.getElementById('cloud-link').href = link('/cloud');
-  document.getElementById('filters').innerHTML = `
-    <span class="filter-label">local cloud</span>
-    <span class="chip active">${status.running ? 'running' : 'stopped'}</span>
-    <span class="chip">${auth ? esc(auth.accountEmail) : 'not logged in'}</span>
-    <span class="chip">${status.dbExists ? 'database ready' : 'no database'}</span>`;
-  renderCloudTable(teams, environments);
-  renderCloudDetail(status, teams, environments, audit);
-}
-
-function renderCloudTable(teams, environments) {
-  const table = document.getElementById('main-table');
-  table.innerHTML = `<thead><tr>
-    <th>kind</th><th>name</th><th>owner / project</th><th>access</th><th>updated</th>
-  </tr></thead><tbody></tbody>`;
-  const tbody = table.querySelector('tbody');
-  teams.forEach(team => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><span class="badge badge-session">team</span></td>
-      <td>${esc(team.name)}</td>
-      <td>${esc(team.ownerEmail)}</td>
-      <td>${statusBadge(true, 'managed')}</td>
-      <td>${esc((team.createdAt || '').slice(0, 19))}</td>`;
-    tbody.appendChild(tr);
-  });
-  environments.forEach(env => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><span class="badge badge-request">environment</span></td>
-      <td>${esc(env.teamName)} / ${esc(env.projectName)} / ${esc(env.name)}</td>
-      <td>${esc(env.projectName)}</td>
-      <td>${statusBadge(env.keyWrapAvailable && !env.rewrapRequired, env.rewrapRequired ? 'rewrap required' : (env.keyWrapAvailable ? 'available' : 'locked'))}</td>
-      <td>${esc((env.updatedAt || '').slice(0, 19))}</td>`;
-    tbody.appendChild(tr);
-  });
-  document.getElementById('item-count').textContent = `${teams.length} teams`;
-  document.getElementById('filter-count').textContent = `${environments.length} environments`;
-}
-
-function renderCloudDetail(status, teams, environments, audit) {
-  const instance = status.instance || null;
-  const auth = status.auth || null;
-  const backendLabel = status.running && instance ? `${esc(instance.url)} · pid ${esc(instance.pid)}` : `start with ${esc('ward cloud dev start')}`;
-  const loginUrl = instance ? instance.url : 'http://127.0.0.1:8787';
-  const pane = document.getElementById('detail-pane');
-  pane.innerHTML = `
-    <div class="detail-header">
-      <span class="badge ${status.running ? 'badge-ok' : 'badge-warn'}">${status.running ? 'running' : 'stopped'}</span>
-      <span class="detail-title">local cloud dev</span>
-    </div>
-    ${field('backend', backendLabel)}
-    ${field('database', shortPath(status.db || ''))}
-    ${field('account', auth ? `${esc(auth.accountEmail)} · ${esc(auth.deviceName)}` : `login with ${esc('ward auth login --cloud-url ')}${esc(loginUrl)}`)}
-    ${field('teams', String(teams.length))}
-    ${field('accessible environments', String(environments.length))}
-    <div class="field-group">
-      <div class="field-label">environments</div>
-      <div class="field-value">${environments.map(env => `
-        <div class="policy-card">
-          <div class="policy-actions">
-            <span><span class="badge badge-neutral">${esc(env.name)}</span> ${esc(env.teamName)} / ${esc(env.projectName)}</span>
-            ${statusBadge(env.keyWrapAvailable && !env.rewrapRequired, env.rewrapRequired ? 'rewrap required' : (env.keyWrapAvailable ? 'ready' : 'locked'))}
-          </div>
-          <div>${(env.envNames || []).map(envChip).join('') || '<span class="sev-info">no env names</span>'}</div>
-          <div class="finding-msg">${(env.profileNames || []).length} profile(s), ${(env.agentNames || []).length} agent policy name(s)</div>
-        </div>`).join('') || '<span class="sev-info">none</span>'}</div>
-    </div>
-    <div class="field-group">
-      <div class="field-label">recent cloud audit</div>
-      <div class="field-value">${audit.slice(0, 8).map(event => `
-        <div class="policy-card">
-          <div class="policy-actions">
-            <span><span class="badge badge-approval">${esc(event.payload && event.payload.type ? event.payload.type : 'audit')}</span> ${esc(event.actorEmail || '-')}</span>
-            <span class="detail-ts">${esc((event.createdAt || '').slice(0, 19))}</span>
-          </div>
-          <pre>${esc(JSON.stringify(event.payload || {}, null, 2))}</pre>
-        </div>`).join('') || '<span class="sev-info">no synced audit events</span>'}</div>
-    </div>`;
-}
-
 function splitList(value) {
   return String(value || '').split(',').map(item => item.trim()).filter(Boolean);
 }
@@ -1181,8 +832,6 @@ function renderLogs() {
   document.getElementById('page-title').textContent = title;
   document.getElementById('overview-link').href = link('/');
   document.getElementById('logs-link').href = link('/logs');
-  document.getElementById('team-link').href = link(logsProject ? `/projects/${encodeURIComponent(logsProject)}/team` : '/team');
-  document.getElementById('cloud-link').href = link('/cloud');
   renderLogFilters();
   renderLogTable();
   const selectedEvent = selectedLogEvent();
@@ -1539,9 +1188,6 @@ function renderProvisionForm() {
         ${profileNames.map(name => `<label><input type="checkbox" data-provision-profile="${esc(name)}" checked>${esc(name)}</label>`).join('') || '<span class="sev-info">none</span>'}
       </div>
       <input class="full" data-field="agents" placeholder="agent allowlist, comma separated">
-      <div class="field-label full">initial team members</div>
-      <input data-field="members" placeholder="member ids/emails, comma separated">
-      ${dropdownMarkup('memberRole', 'developer', ['owner','admin','developer','viewer'])}
       <div class="full inline-form">
         <button class="btn primary" data-provision-create>create</button>
       </div>
@@ -1565,13 +1211,7 @@ async function createProvisionProject() {
     project: editor.querySelector('[data-field="project"]').value.trim(),
     env: [...editor.querySelectorAll('[data-provision-env]:checked')].map(input => input.dataset.provisionEnv),
     profiles: [...editor.querySelectorAll('[data-provision-profile]:checked')].map(input => input.dataset.provisionProfile),
-    agents: splitList(editor.querySelector('[data-field="agents"]').value),
-    members: splitList(editor.querySelector('[data-field="members"]').value).map(id => ({
-      id,
-      name: id,
-      role: editor.querySelector('[data-field="memberRole"]').dataset.value,
-      agents: []
-    }))
+    agents: splitList(editor.querySelector('[data-field="agents"]').value)
   };
   try {
     const result = await api('/api/projects/provision', { method: 'POST', body: JSON.stringify(body) });

@@ -124,10 +124,8 @@ pub fn append_event<T: Serialize>(kind: LogKind, payload: T) -> Result<()> {
         timestamp: chrono::Utc::now().to_rfc3339(),
         payload,
     };
-    let sync_event = serde_json::to_value(&event)?;
     let payload = serde_json::to_vec(&event)?;
     append_encrypted_payload(kind, &payload)?;
-    let _ = crate::cloud::sync_local_audit_event(kind, &sync_event);
     Ok(())
 }
 
