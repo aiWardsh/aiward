@@ -676,12 +676,20 @@ pub fn resolve_vault_path_checked(cwd: &Path, config: &ProjectConfig) -> Result<
 /// Derives the vault path from passphrase + project + nonce when dynamic naming is active.
 /// Falls back to the static path for keychain mode or legacy configs.
 pub fn resolve_vault_path_dynamic(cwd: &Path, config: &ProjectConfig, passphrase: &str) -> PathBuf {
+    resolve_vault_path_dynamic_checked(cwd, config, passphrase)
+        .expect("derived vault path should stay inside the project")
+}
+
+pub fn resolve_vault_path_dynamic_checked(
+    cwd: &Path,
+    config: &ProjectConfig,
+    passphrase: &str,
+) -> Result<PathBuf> {
     if config.storage_mode == StorageMode::Keychain || config.vault_nonce.is_empty() {
-        return resolve_vault_path(cwd, config);
+        return resolve_vault_path_checked(cwd, config);
     }
     let filename = vault::derive_vault_filename(passphrase, &config.project, &config.vault_nonce);
     fs_util::resolve_project_path(cwd, Path::new(&filename), "derived vault path")
-        .expect("derived vault filename should stay inside the project")
 }
 
 /// Resolves the current vault path when a passphrase is available.
@@ -694,12 +702,21 @@ pub fn resolve_vault_path_with_passphrase(
     config: &ProjectConfig,
     passphrase: &str,
 ) -> PathBuf {
-    let configured = resolve_vault_path(cwd, config);
-    let derived = resolve_vault_path_dynamic(cwd, config, passphrase);
+    resolve_vault_path_with_passphrase_checked(cwd, config, passphrase)
+        .expect("project config vault path should be validated before resolving")
+}
+
+pub fn resolve_vault_path_with_passphrase_checked(
+    cwd: &Path,
+    config: &ProjectConfig,
+    passphrase: &str,
+) -> Result<PathBuf> {
+    let configured = resolve_vault_path_checked(cwd, config)?;
+    let derived = resolve_vault_path_dynamic_checked(cwd, config, passphrase)?;
     if derived.exists() || !configured.exists() {
-        derived
+        Ok(derived)
     } else {
-        configured
+        Ok(configured)
     }
 }
 

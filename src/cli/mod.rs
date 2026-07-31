@@ -5888,17 +5888,29 @@ fn restore_ward_off_target(
     passphrase: &str,
     timestamp: &str,
 ) -> WardOffProjectStatus {
-    let vault = resolve_ward_off_vault_path(target, passphrase);
     if !target.path.is_dir() {
         return WardOffProjectStatus {
             project: target.project.clone(),
             path: target.path.clone(),
-            vault: Some(vault),
+            vault: None,
             output: None,
             status: "skipped".to_string(),
             message: "project path missing".to_string(),
         };
     }
+    let vault = match resolve_ward_off_vault_path(target, passphrase) {
+        Ok(vault) => vault,
+        Err(error) => {
+            return WardOffProjectStatus {
+                project: target.project.clone(),
+                path: target.path.clone(),
+                vault: None,
+                output: None,
+                status: "failed".to_string(),
+                message: error.to_string(),
+            }
+        }
+    };
     if !vault.exists() {
         return WardOffProjectStatus {
             project: target.project.clone(),
@@ -5931,37 +5943,54 @@ fn restore_ward_off_target(
     }
 }
 
-fn resolve_ward_off_vault_path(target: &WardOffTarget, passphrase: &str) -> PathBuf {
+fn resolve_ward_off_vault_path(target: &WardOffTarget, passphrase: &str) -> Result<PathBuf> {
     let mut candidates = Vec::new();
+    let mut errors = Vec::new();
     if let Ok(project_config) = config::read_project_config(&target.path) {
-        push_unique_path(
+        push_ward_off_config_vault_candidates(
             &mut candidates,
-            config::resolve_vault_path_with_passphrase(&target.path, &project_config, passphrase),
-        );
-        push_unique_path(
-            &mut candidates,
-            config::resolve_vault_path(&target.path, &project_config),
+            &mut errors,
+            &target.path,
+            &project_config,
+            passphrase,
         );
     }
     if let Some(project_config) = target.config.as_ref() {
-        push_unique_path(
+        push_ward_off_config_vault_candidates(
             &mut candidates,
-            config::resolve_vault_path_with_passphrase(&target.path, project_config, passphrase),
-        );
-        push_unique_path(
-            &mut candidates,
-            config::resolve_vault_path(&target.path, project_config),
+            &mut errors,
+            &target.path,
+            project_config,
+            passphrase,
         );
     }
     if let Some(vault) = target.registered_vault.as_ref() {
-        push_unique_path(&mut candidates, vault.clone());
+        push_ward_off_vault_candidate(
+            &mut candidates,
+            &mut errors,
+            fs_util::resolve_project_path(&target.path, vault, "registered vault path"),
+        );
     }
-    push_unique_path(
+    push_ward_off_vault_candidate(
         &mut candidates,
-        target.path.join(config::DEFAULT_VAULT_FILE),
+        &mut errors,
+        fs_util::resolve_project_path(
+            &target.path,
+            Path::new(config::DEFAULT_VAULT_FILE),
+            "default vault path",
+        ),
     );
 
-    candidates
+    if candidates.is_empty() {
+        let detail = if errors.is_empty() {
+            "no vault candidates found".to_string()
+        } else {
+            errors.join("; ")
+        };
+        anyhow::bail!("no usable vault path found: {detail}");
+    }
+
+    Ok(candidates
         .iter()
         .find(|candidate| candidate.exists())
         .cloned()
@@ -5970,7 +5999,37 @@ fn resolve_ward_off_vault_path(target: &WardOffTarget, passphrase: &str) -> Path
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| target.path.join(config::DEFAULT_VAULT_FILE))
-        })
+        }))
+}
+
+fn push_ward_off_config_vault_candidates(
+    candidates: &mut Vec<PathBuf>,
+    errors: &mut Vec<String>,
+    project_path: &Path,
+    project_config: &config::ProjectConfig,
+    passphrase: &str,
+) {
+    push_ward_off_vault_candidate(
+        candidates,
+        errors,
+        config::resolve_vault_path_dynamic_checked(project_path, project_config, passphrase),
+    );
+    push_ward_off_vault_candidate(
+        candidates,
+        errors,
+        config::resolve_vault_path_checked(project_path, project_config),
+    );
+}
+
+fn push_ward_off_vault_candidate(
+    candidates: &mut Vec<PathBuf>,
+    errors: &mut Vec<String>,
+    result: Result<PathBuf>,
+) {
+    match result {
+        Ok(path) => push_unique_path(candidates, path),
+        Err(error) => errors.push(error.to_string()),
+    }
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -10586,6 +10645,36 @@ mod tests {
         assert!(targets[0].registered_vault.is_some());
 
         std::env::remove_var("WARD_HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ward_off_restore_reports_symlinked_relative_vault_without_panicking() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_vault = outside.path().join(config::DEFAULT_VAULT_FILE);
+        std::fs::write(&outside_vault, "not a vault").unwrap();
+        std::os::unix::fs::symlink(
+            &outside_vault,
+            project.path().join(config::DEFAULT_VAULT_FILE),
+        )
+        .unwrap();
+
+        let mut project_config =
+            ProjectConfig::default_for_dir(project.path(), Some("demo".to_string())).unwrap();
+        project_config.vault_nonce.clear();
+        let target = WardOffTarget {
+            project: "demo".to_string(),
+            path: project.path().to_path_buf(),
+            config: Some(project_config),
+            registered_vault: None,
+        };
+
+        let status = restore_ward_off_target(&target, "1234", "20260731");
+
+        assert_eq!(status.status, "failed");
+        assert!(status.message.contains("no usable vault path found"));
+        assert!(status.message.contains("vault path must stay inside"));
     }
 
     #[test]
