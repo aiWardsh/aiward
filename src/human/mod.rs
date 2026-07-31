@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{broker, config, fs_util, term, workspace_target};
+use crate::{broker, config, fs_util, global_disable, term, workspace_target};
 use base64::Engine as _;
 
 const HUMAN_ACTIVATION_BODY: &str =
@@ -249,6 +249,11 @@ pub fn activate_human_mode(
     ttl: &str,
 ) -> Result<()> {
     use crate::{logs::LogKind, registry, unlock, vault};
+
+    if global_disable::is_disabled() {
+        term::warn("Ward is globally disabled — run: ward on");
+        return Ok(());
+    }
 
     let cwd = std::env::current_dir()?;
     let selector = workspace_target::TargetSelector { project, app, all };

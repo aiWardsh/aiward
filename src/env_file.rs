@@ -47,6 +47,23 @@ pub fn unlock_env_file(
     write_plaintext_env(env_path, &plaintext, true)
 }
 
+pub fn unlock_env_file_preserving_plaintext(
+    env_path: &Path,
+    vault_path: &Path,
+    passphrase: &str,
+    timestamp: &str,
+) -> Result<PathBuf> {
+    let plaintext = vault::decrypt_vault_file(vault_path, passphrase)?;
+    ensure_not_locked_marker(&plaintext, vault_path)?;
+    let output = if env_path.exists() && !is_locked_env_file(env_path)? {
+        sibling_with_file_name(env_path, &format!(".env.ward-off.{timestamp}"))
+    } else {
+        env_path.to_path_buf()
+    };
+    write_plaintext_env(&output, &plaintext, true)?;
+    Ok(output)
+}
+
 pub fn export_env_file(
     output: &Path,
     vault_path: &Path,
@@ -286,6 +303,13 @@ fn display_path(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn sibling_with_file_name(path: &Path, file_name: &str) -> PathBuf {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(file_name))
+        .unwrap_or_else(|| PathBuf::from(file_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +419,44 @@ mod tests {
         let unsafe_existing = tempdir.path().join(".env.unsafe");
         std::fs::write(&unsafe_existing, "DATABASE_URL=postgres://plaintext\n").unwrap();
         assert!(unlock_env_file(&unsafe_existing, &vault_path, "passphrase", false).is_err());
+    }
+
+    #[test]
+    fn unlock_preserving_plaintext_uses_env_or_sidecar() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let vault_path = tempdir.path().join(".env.vault");
+        let env_path = tempdir.path().join(".env");
+        let envelope = vault::encrypt_env("DATABASE_URL=postgres://local\n", "passphrase").unwrap();
+        vault::write_vault(&vault_path, &envelope).unwrap();
+
+        let missing_output =
+            unlock_env_file_preserving_plaintext(&env_path, &vault_path, "passphrase", "20260731")
+                .unwrap();
+        assert_eq!(missing_output, env_path);
+        assert!(std::fs::read_to_string(&env_path)
+            .unwrap()
+            .contains("postgres://local"));
+
+        std::fs::write(&env_path, "DATABASE_URL=postgres://existing\n").unwrap();
+        let sidecar =
+            unlock_env_file_preserving_plaintext(&env_path, &vault_path, "passphrase", "20260731")
+                .unwrap();
+        assert_eq!(sidecar, tempdir.path().join(".env.ward-off.20260731"));
+        assert!(std::fs::read_to_string(&env_path)
+            .unwrap()
+            .contains("postgres://existing"));
+        assert!(std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains("postgres://local"));
+
+        lock_env_file(&env_path, &vault_path).unwrap();
+        let locked_output =
+            unlock_env_file_preserving_plaintext(&env_path, &vault_path, "passphrase", "ignored")
+                .unwrap();
+        assert_eq!(locked_output, env_path);
+        assert!(std::fs::read_to_string(&env_path)
+            .unwrap()
+            .contains("postgres://local"));
     }
 
     #[test]

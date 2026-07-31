@@ -29,7 +29,7 @@ use crate::{
     approvals::{ApprovalChannel, ApprovalDecision, ApprovalScope, ApprovalSource},
     config, detection, env_file, fs_util, grants, modes, pending_requests,
     policy::{self, AccessRequest},
-    project_store, project_teardown, recovery, registry,
+    project_store, project_teardown, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
     unlock, vault,
 };
@@ -510,6 +510,9 @@ pub fn ensure_running() -> Result<()> {
 
 #[cfg(not(test))]
 pub fn ensure_running() -> Result<()> {
+    if crate::global_disable::is_disabled() {
+        anyhow::bail!("Ward is globally disabled; run `ward on` to re-enable it");
+    }
     match ping_status() {
         Ok(status) if broker_is_current(&status) => return Ok(()),
         Ok(status) if status.running => {
@@ -1972,18 +1975,10 @@ fn provision_project_with_material(
     let envelope = vault::encrypt_env(&selected_plaintext, &material.passphrase)?;
     vault::write_vault(&vault_path, &envelope)?;
     env_file::lock_env_file(&target_path.join(".env"), &vault_path)?;
-    approval_receipts::ensure_project_key(&request.project, &material.passphrase)?;
-    if recovery::create_recovery_files_with_material(
+    approval_receipts::ensure_project_key_after_vault_unlock(
         &request.project,
         &material.passphrase,
-        &material.passphrase,
-        Some(&selected_plaintext),
-    )
-    .is_ok()
-    {
-        target_config.recovery_created = true;
-        let _ = config::write_project_config(&target_path, &target_config, true);
-    }
+    )?;
 
     registry::update_project_vault(&request.project, target_path.clone(), vault_path.clone())?;
     let store = project_store::refresh_from_plaintext(
@@ -2077,19 +2072,7 @@ pub(crate) fn setup_project_with_passphrase(
     vault::import_env_file(&source, &vault_path, passphrase)?;
     let plaintext = vault::decrypt_vault_file(&vault_path, passphrase)?;
     env_file::lock_env_file(&source, &vault_path)?;
-    approval_receipts::ensure_project_key(&project_config.project, passphrase)?;
-
-    if recovery::create_recovery_files_with_material(
-        &project_config.project,
-        passphrase,
-        passphrase,
-        Some(&plaintext),
-    )
-    .is_ok()
-    {
-        project_config.recovery_created = true;
-        let _ = config::write_project_config(&target_path, &project_config, true);
-    }
+    approval_receipts::ensure_project_key_after_vault_unlock(&project_config.project, passphrase)?;
 
     registry::update_project_vault(
         &project_config.project,
@@ -3717,7 +3700,7 @@ mod tests {
         assert!(project.path().join(".ward.json").exists());
         assert!(status.vault.exists());
         let cfg = config::read_project_config(project.path()).unwrap();
-        assert!(cfg.recovery_created);
+        assert!(!cfg.recovery_created);
         assert!(cfg.profiles["dev"]
             .env
             .contains(&"PAYLOAD_SECRET".to_string()));

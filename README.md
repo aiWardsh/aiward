@@ -48,8 +48,7 @@ ward setup
 
 Ward will walk you through:
 - Encrypting your `.env`
-- Creating a vault passphrase
-- Creating a recovery key with the same passphrase
+- Creating a vault PIN/passphrase
 - Detecting workspace apps when the project is a monorepo
 - Wiring up your shell
 
@@ -127,6 +126,38 @@ ward modes status
 ```bash
 ward lock
 ```
+
+## Global off/on
+
+Use `ward off` when you want Ward to stop intercepting normal terminal commands
+across your machine:
+
+```bash
+ward off
+ward off --discover ~/Documents
+```
+
+Ward writes `~/.ward/disabled.json`, stops the local runtime, clears unlock
+sessions and session grants, then restores plaintext `.env` files for every
+known project it can decrypt. Known projects come from `~/.ward/registry.json`
+and `~/.ward/config-backups/`; `--discover` adds projects found under the given
+root. If one project uses a different PIN/passphrase or cannot be decrypted,
+Ward reports that failure and continues with the others.
+
+Ward never deletes `.ward.json`, `.env.vault`, registry entries, grants, logs,
+recovery files, config backups, or generated agent instructions. If `.env`
+already contains non-Ward plaintext, Ward writes a sidecar file named
+`.env.ward-off.<timestamp>` instead of overwriting it.
+
+Turn Ward back on with:
+
+```bash
+ward on
+```
+
+`ward on` only removes `~/.ward/disabled.json`. It does not relock plaintext
+`.env` files; run `ward env lock` in each project when you are ready to return
+to normal encrypted operation.
 
 ---
 
@@ -294,7 +325,8 @@ ward logs verify            # verify log integrity
 ward doctor
 ```
 
-Checks your setup: vault, broker, gitignore, grants, recovery key, and log integrity. Run this if something feels off.
+Checks your setup: vault, global off/on state, broker, gitignore, grants,
+PIN-based recovery, and log integrity. Run this if something feels off.
 
 ---
 
@@ -360,7 +392,7 @@ Ward is designed for a specific threat: AI agents accessing secrets through comm
 Within that boundary, ward gives you hard guarantees:
 
 - **Vault rotation can move the vault to a derived filename.** The default vault file is `.env.vault`; `ward rotate` moves it to a passphrase-derived hidden filename and updates the registry and locked `.env` marker.
-- **Session encryption.** While an unlock session is active, the vault on disk is re-encrypted with a random ephemeral key held only in broker memory. Your passphrase-encrypted form does not exist on disk during an active session.
+- **PIN-derived vault encryption.** The vault on disk stays encrypted by your PIN/passphrase-derived key, so `.env.vault` plus the PIN/passphrase can decrypt after reinstall.
 - **Authenticated broker operations.** Session-backed broker calls that execute commands, enumerate vault keys, sign approvals, or set up new projects require a trusted Ward client process and request authorization bound to the exact operation. Raw socket clients cannot bypass Ward policy just because a session is unlocked.
 - **Broker-owned approval authority.** Agents can request access and wait, but
   they cannot create approvals, claim `agent-mediated` approval, or decide that
@@ -369,8 +401,10 @@ Within that boundary, ward gives you hard guarantees:
   `session` approvals must match active broker state before envs decrypt;
   `branch` and `always` grants remain durable but are still broker-signed and
   matched to the exact command, env names, agent identity, and git context.
-- **Recovery key.** A recovery key is stored locally and encrypted with the same vault passphrase. If a session is interrupted and the broker can't restore the vault automatically, ward can use the recovery file plus your passphrase to restore access. The recovery directory contains decoys — files that are indistinguishable from the real key without the correct passphrase.
-- **Secrets are never written to disk in plaintext** during normal operation.
+- **Simple recovery.** Keep `.env.vault` and remember the PIN/passphrase. Four digits are convenient for daily testing, but weak if the encrypted vault leaks; longer PINs/passphrases improve offline resistance without changing the workflow.
+- **Secrets are never written to disk in plaintext** during normal operation;
+  `ward off` is the explicit reversible escape hatch that restores plaintext
+  `.env` files for convenience.
 - **Every secret injection is logged** with the requesting identity and scope.
 - **Approval grants are signed by Ward** — editing them invalidates them.
 - **Audit logs are hash-chained** — tampering is detectable.
@@ -383,13 +417,14 @@ Ward operates at the workflow layer, not the OS level. The protection is effecti
 
 ```bash
 ward rotate                         # rotate vault to a new derived filename
-ward recovery create                # create a passphrase-protected recovery key
+ward recovery create                # optional legacy passphrase-protected recovery key
 ward recovery export                # save a backup to a safe location
 ward recovery import /path/to/file  # restore a recovery key from backup
 ward recovery restore               # rewrite the vault from recovery material
 ```
 
-Ward doctor will warn you if the recovery key is missing or if no backup has been exported.
+The primary recovery path is `.env.vault` plus the PIN/passphrase. If `.env.vault`
+is ignored by git, back it up separately before deleting or reinstalling Ward.
 
 ---
 

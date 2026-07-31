@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -16,8 +17,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     agents, anomaly,
     approvals::{self, ApprovalChannel, ApprovalDecision, ApprovalScope},
-    broker, config, context, detection, env_file, fs_util, git_context, grants,
-    logs::{self as audit_logs, self as logs, LogKind},
+    broker, config, context, detection, env_file, fs_util, git_context, global_disable, grants,
+    logs::{self as audit_logs, LogKind},
     modes, notifications, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
     project_store, recovery, registry,
@@ -370,6 +371,21 @@ pub enum Commands {
         workspace: bool,
         #[arg(long)]
         all: bool,
+    },
+    /// Disable Ward globally and restore plaintext env files for known projects.
+    Off {
+        /// Add Ward projects discovered under this root before restoring env files.
+        #[arg(long)]
+        discover: Option<PathBuf>,
+        /// Print machine-readable disable summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-enable Ward globally without deleting plaintext env files.
+    On {
+        /// Print machine-readable enable summary.
+        #[arg(long)]
+        json: bool,
     },
     /// Export plaintext env and remove Ward files from a project.
     Teardown {
@@ -1046,6 +1062,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             workspace,
             all,
         } => lock(project, app, workspace, all),
+        Commands::Off { discover, json } => ward_off(discover, json),
+        Commands::On { json } => ward_on(json),
         Commands::Teardown {
             project,
             app,
@@ -1173,6 +1191,13 @@ struct ExecutionStartedEvent<'a> {
     declared_action: &'a Option<String>,
     requested_command: &'a str,
     cwd: &'a Path,
+    execution_cwd: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_root: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_relative_path: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mounted_command: Option<&'a str>,
     git: &'a git_context::GitContext,
     requested_env: &'a [String],
     injected_env: &'a [String],
@@ -1204,6 +1229,13 @@ struct ExecutionEvent<'a> {
     declared_action: &'a Option<String>,
     requested_command: &'a str,
     cwd: &'a Path,
+    execution_cwd: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_root: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_relative_path: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mounted_command: Option<&'a str>,
     git: &'a git_context::GitContext,
     requested_env: &'a [String],
     injected_env: &'a [String],
@@ -1271,6 +1303,68 @@ struct LogsUnlockEvent<'a> {
     expires_at: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WardOffEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    disabled_path: &'a Path,
+    restored: usize,
+    skipped: usize,
+    failed: usize,
+    revoked_session_grants: usize,
+    cleared_unlock_sessions: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WardOnEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    disabled_path: &'a Path,
+    removed_disabled_state: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WardOffTarget {
+    project: String,
+    path: PathBuf,
+    config: Option<config::ProjectConfig>,
+    registered_vault: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WardOffProjectStatus {
+    project: String,
+    path: PathBuf,
+    vault: Option<PathBuf>,
+    output: Option<PathBuf>,
+    status: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WardOffSummary {
+    disabled: bool,
+    disabled_path: PathBuf,
+    restored: usize,
+    skipped: usize,
+    failed: usize,
+    revoked_session_grants: usize,
+    cleared_unlock_sessions: usize,
+    projects: Vec<WardOffProjectStatus>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WardOnSummary {
+    disabled: bool,
+    disabled_path: PathBuf,
+    removed_disabled_state: bool,
+}
+
 #[derive(Debug, Clone)]
 struct SetupOptions {
     yes: bool,
@@ -1289,9 +1383,6 @@ const SETUP_GUIDED_BODY: &str = "Ward will encrypt your local env, create a vaul
 const WORKSPACE_SETUP_BODY: &str = "Ward detected a monorepo workspace. It will configure each app with its own encrypted vault and trust this workspace Git root for agent runs.";
 const WORKSPACE_SETUP_PROMPT_HELP: &str =
     "Ward will create or refresh app-level .ward.json files, vaults, profiles, and workspace-root trust.";
-const RECOVERY_EXPORT_PROMPT: &str = "Export a recovery backup now?";
-const RECOVERY_EXPORT_HELP: &str =
-    "Store this somewhere safe, such as a USB drive or secure cloud backup.";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1457,6 +1548,13 @@ struct ResolvedProfile {
     env_names: Vec<String>,
     action: Option<String>,
     default_scope: ApprovalScope,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedProfile {
+    profile: ResolvedProfile,
+    policy_command: String,
+    mounted: bool,
 }
 
 fn setup(options: SetupOptions) -> Result<()> {
@@ -1629,14 +1727,12 @@ fn setup(options: SetupOptions) -> Result<()> {
         removed_plaintext = true;
     }
 
-    // Resolve passphrase at outer scope so we can reuse it for recovery creation.
-    let setup_passphrase_final: Option<String> = if options.no_unlock {
-        setup_passphrase
-    } else {
-        Some(match setup_passphrase {
-            Some(p) => p,
-            None => vault::read_existing_passphrase()?,
-        })
+    // Resolve and validate the PIN/passphrase even when --no-unlock is used.
+    // Reinstall recovery depends on `.env.vault` remaining decryptable by this value.
+    let setup_passphrase_final: Option<String> = match setup_passphrase {
+        Some(passphrase) => Some(passphrase),
+        None if vault_path.exists() => Some(vault::read_existing_passphrase()?),
+        None => None,
     };
 
     if recovery_plaintext.is_none() {
@@ -1706,71 +1802,16 @@ fn setup(options: SetupOptions) -> Result<()> {
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
 
-    // Auto-create recovery key using the same PIN/passphrase — no extra prompt.
-    if let Some(ref passphrase) = setup_passphrase_final {
-        term::section("recovery");
-        let sp = term::spinner("Creating recovery key");
-        match recovery::create_recovery_files_with_material(
-            &project_config.project,
-            passphrase,
-            passphrase,
-            recovery_plaintext.as_deref(),
-        ) {
-            Ok(recovery_file) => {
-                term::done_detail(
-                    sp,
-                    "recovery key created",
-                    &term::short_path(&recovery_file),
-                );
-                project_config.recovery_created = true;
-                let _ = config::write_project_config(&cwd, &project_config, true);
-
-                // Offer to export a backup immediately.
-                #[cfg(not(coverage))]
-                {
-                    term::blank();
-                    let export = options.yes
-                        || inquire::Confirm::new(RECOVERY_EXPORT_PROMPT)
-                            .with_help_message(RECOVERY_EXPORT_HELP)
-                            .with_default(true)
-                            .prompt()
-                            .unwrap_or(false);
-
-                    if export {
-                        let dest = dirs::desktop_dir()
-                            .or_else(dirs::home_dir)
-                            .unwrap_or_else(|| PathBuf::from("."));
-                        match recovery::export_recovery_file(
-                            &project_config.project,
-                            passphrase,
-                            &dest,
-                        ) {
-                            Ok(out_path) => {
-                                project_config.backup_exported = true;
-                                let _ = config::write_project_config(&cwd, &project_config, true);
-                                term::ok_detail("backup saved", &term::short_path(&out_path));
-                                #[cfg(not(test))]
-                                let _ = std::process::Command::new("open")
-                                    .arg("-R")
-                                    .arg(&out_path)
-                                    .spawn();
-                            }
-                            Err(e) => {
-                                term::warn_detail("backup export failed", &e.to_string());
-                                term::next("run: ward recovery export");
-                            }
-                        }
-                    } else {
-                        term::next("run: ward recovery export");
-                    }
-                }
-            }
-            Err(error) => {
-                term::warn_step_detail(sp, "recovery key failed", &error.to_string());
-                term::next("run: ward recovery create");
-            }
-        }
+    term::section("Recovery");
+    if setup_passphrase_final.is_some() {
+        term::ok("vault recoverable with .env.vault + PIN/passphrase");
+    } else {
+        term::warn("vault recovery not validated");
     }
+    if options.ignore_vault {
+        term::warn("backup .env.vault separately; it is ignored by git for this project");
+    }
+    term::info("Optional legacy backup: ward recovery create && ward recovery export");
 
     term::blank();
     if unlock_session.is_none() {
@@ -3525,11 +3566,15 @@ fn request_for_target(
     no_prompt: bool,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
-    let target =
-        workspace_target::resolve_one(&workspace_target::TargetSelector::one(project, app), &cwd)?;
-    let resolved = target.resolved_project();
+    let profile_command = profile.is_some() && command.is_none();
+    let plan = workspace_target::resolve_execution_plan(
+        &workspace_target::TargetSelector::one(project, app),
+        &cwd,
+        workspace_target::ExecutionPlanOptions { profile_command },
+    )?;
+    let resolved = plan.resolved_project();
     let config = config::read_project_config(&resolved.path)?;
-    let git = git_context::collect_git_context(&cwd);
+    let git = git_context::collect_git_context(&plan.execution_cwd);
     let mut context_options = context_options;
     let human_terminal = crate::human::is_human_terminal();
     if human_terminal && !agent_identity_is_present(context_options.agent.as_deref()) {
@@ -3538,6 +3583,8 @@ fn request_for_target(
     let branch = context_options.branch.clone().or(git.branch.clone());
     let resolved_profile =
         resolve_profile(&config, profile.as_deref(), action, command, env_names)?;
+    let planned_profile = plan_resolved_profile(&plan, resolved_profile, profile.is_some())?;
+    let resolved_profile = planned_profile.profile;
     if !human_terminal && !no_prompt {
         require_agent_identity_for_non_human(context_options.agent.as_deref())?;
     }
@@ -3549,13 +3596,15 @@ fn request_for_target(
         command: resolved_profile.command,
         env: resolved_profile.env_names,
     };
-    let evaluation = evaluate_access(&config, &access);
+    let evaluation =
+        evaluate_access_with_policy_command(&config, &access, &planned_profile.policy_command);
 
     if no_prompt {
         if !json {
             anyhow::bail!("--no-prompt requires --json");
         }
-        let Some(verified_context) = verified_no_prompt_context(&cwd, &resolved, &context_options)?
+        let Some(verified_context) =
+            verified_no_prompt_context(&plan.execution_cwd, &resolved, &context_options)?
         else {
             return Ok(());
         };
@@ -3669,9 +3718,14 @@ fn allow_for_target(
     env_names: Vec<String>,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
-    let target =
-        workspace_target::resolve_one(&workspace_target::TargetSelector::one(project, app), &cwd)?;
-    let resolved = target.resolved_project();
+    let profile_selected = profile.is_some();
+    let profile_command = profile_selected && command.is_none();
+    let plan = workspace_target::resolve_execution_plan(
+        &workspace_target::TargetSelector::one(project, app),
+        &cwd,
+        workspace_target::ExecutionPlanOptions { profile_command },
+    )?;
+    let resolved = plan.resolved_project();
     let config = config::read_project_config(&resolved.path)?;
     let resolved_profile = resolve_profile(
         &config,
@@ -3680,9 +3734,11 @@ fn allow_for_target(
         command,
         env_names,
     )?;
+    let planned_profile = plan_resolved_profile(&plan, resolved_profile, profile_selected)?;
+    let resolved_profile = planned_profile.profile;
     let scope = match scope {
         Some(scope) => scope,
-        None if profile.is_some() => resolved_profile.default_scope,
+        None if profile_selected => resolved_profile.default_scope,
         None => anyhow::bail!("--scope is required unless --profile is used"),
     };
     if matches!(scope, ApprovalScope::Once | ApprovalScope::Deny) {
@@ -3691,7 +3747,7 @@ fn allow_for_target(
     require_manual_allow_confirmation(scope)?;
     require_agent_identity_for_non_human(agent.as_deref())?;
 
-    let git = git_context::collect_git_context(&cwd);
+    let git = git_context::collect_git_context(&plan.execution_cwd);
     let branch = branch.or(git.branch.clone());
     let correlation_id = uuid::Uuid::new_v4();
     let access = AccessRequest {
@@ -3702,7 +3758,8 @@ fn allow_for_target(
         command: resolved_profile.command,
         env: resolved_profile.env_names,
     };
-    let evaluation = evaluate_access(&config, &access);
+    let evaluation =
+        evaluate_access_with_policy_command(&config, &access, &planned_profile.policy_command);
     if detection::has_critical_findings(&evaluation.findings) {
         anyhow::bail!(
             "critical exploit findings cannot be stored as durable allow grants; use ward request and approve once with --confirm-critical"
@@ -4293,15 +4350,14 @@ fn run_with_context(
     }
     let invocation_cwd = env::current_dir()?;
     let selector = workspace_target::TargetSelector::one(options.project.clone(), app);
-    let target = workspace_target::resolve_one(&selector, &invocation_cwd)?;
-    let explicit_target = options.project.is_some() || selector.app.is_some();
     let profile_command = options.profile.is_some() && options.command.is_empty();
-    let cwd = if explicit_target && profile_command {
-        target.path.clone()
-    } else {
-        invocation_cwd
-    };
-    let resolved = target.resolved_project();
+    let plan = workspace_target::resolve_execution_plan(
+        &selector,
+        &invocation_cwd,
+        workspace_target::ExecutionPlanOptions { profile_command },
+    )?;
+    let cwd = plan.execution_cwd.clone();
+    let resolved = plan.resolved_project();
     let config = config::read_project_config(&resolved.path)?;
     let git = git_context::collect_git_context(&cwd);
     let branch = options.branch.or(git.branch.clone());
@@ -4350,10 +4406,16 @@ fn run_with_context(
         options.command,
         human_terminal,
     )?;
+    let planned_profile =
+        plan_resolved_profile(&plan, resolved_profile, options.profile.is_some())?;
+    let resolved_profile = planned_profile.profile;
     if !human_terminal && !options.no_prompt {
         require_agent_identity_for_non_human(options.agent.as_deref())?;
     }
     let command_text = resolved_profile.command.clone();
+    let mounted_command = planned_profile
+        .mounted
+        .then(|| resolved_profile.command.clone());
 
     let access = AccessRequest {
         project: resolved.name.clone(),
@@ -4363,7 +4425,8 @@ fn run_with_context(
         command: command_text.clone(),
         env: resolved_profile.env_names.clone(),
     };
-    let evaluation = evaluate_access(&config, &access);
+    let evaluation =
+        evaluate_access_with_policy_command(&config, &access, &planned_profile.policy_command);
     let mut verified_context = None;
     let mut correlation_id = uuid::Uuid::new_v4();
     let mut linked_request_id = None;
@@ -4538,6 +4601,10 @@ fn run_with_context(
         declared_action: &access.action,
         requested_command: &command_text,
         cwd: &cwd,
+        execution_cwd: &cwd,
+        workspace_root: plan.workspace_root.as_deref(),
+        app_relative_path: plan.app_relative_path.as_deref(),
+        mounted_command: mounted_command.as_deref(),
         git: &git,
         requested_env: &evaluation.requested_env,
         injected_env: &decision.approved_env,
@@ -4667,6 +4734,10 @@ fn run_with_context(
         declared_action: &access.action,
         requested_command: &command_text,
         cwd: &cwd,
+        execution_cwd: &cwd,
+        workspace_root: plan.workspace_root.as_deref(),
+        app_relative_path: plan.app_relative_path.as_deref(),
+        mounted_command: mounted_command.as_deref(),
         git: &git,
         requested_env: &evaluation.requested_env,
         injected_env: &decision.approved_env,
@@ -4804,6 +4875,8 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
         .to_string();
 
     term::header_cmd("doctor", &project_name);
+
+    doctor_global_state();
 
     // ── config ────────────────────────────────────────────────────────────────
     term::section("config");
@@ -5112,36 +5185,18 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
     term::section("recovery");
 
     if let Ok(cfg) = &project_config {
-        let recovery_dir = logs::recovery_dir();
-        let key_files_exist = recovery_dir.exists()
-            && fs::read_dir(&recovery_dir)
-                .map(|mut d| {
-                    d.any(|e| {
-                        e.map(|e| e.path().extension().and_then(|x| x.to_str()) == Some("key"))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-
-        if cfg.recovery_created && !key_files_exist {
-            term::fail("recovery key missing — run: ward recovery create");
-            term::info(&format!("expected in {}", term::short_path(&recovery_dir)));
-        } else if cfg.recovery_created {
-            term::ok("recovery key present");
-            if !cfg.backup_exported {
-                term::warn("no backup exported — run: ward recovery export");
-            } else {
-                term::ok("recovery backup exported");
-            }
-        } else {
-            term::warn("recovery key not created — run: ward recovery create");
-        }
-
+        term::ok("primary recovery uses .env.vault + PIN/passphrase");
         if vault::test_passphrase().is_some() {
             let passphrase = vault::test_passphrase().unwrap();
-            if !recovery::recovery_file_exists(&cfg.project, &passphrase) {
-                term::fail("recovery file not found at derived path — run: ward recovery create");
+            let vault_path = config::resolve_vault_path_with_passphrase(&cwd, cfg, &passphrase);
+            if vault::decrypt_vault_file(&vault_path, &passphrase).is_ok() {
+                term::ok("vault decrypts with configured PIN/passphrase");
+            } else {
+                term::fail("vault did not decrypt with configured PIN/passphrase");
             }
+        }
+        if cfg.recovery_created {
+            term::info("legacy recovery file configured");
         }
     } else {
         term::warn("unable to check recovery — config not readable");
@@ -5149,6 +5204,24 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
 
     term::blank();
     Ok(())
+}
+
+fn doctor_global_state() {
+    term::section("global");
+
+    match global_disable::read() {
+        Ok(Some(state)) => {
+            term::warn("Ward globally disabled — run: ward on");
+            term::info(&format!("disabled at {}", state.disabled_at.to_rfc3339()));
+            term::info(&format!("reason {}", state.reason));
+            term::info(&format!(
+                "state {}",
+                term::short_path(&global_disable::disabled_path())
+            ));
+        }
+        Ok(None) => term::ok("Ward enabled"),
+        Err(error) => term::fail(&format!("disabled state unreadable — {error}")),
+    }
 }
 
 fn doctor_vault_path(cwd: &Path, cfg: &config::ProjectConfig) -> PathBuf {
@@ -5532,6 +5605,382 @@ fn lock(
     term::ok_detail("session grants revoked", &revoked.to_string());
     term::ok_detail("unlock metadata cleared", &cleared_unlocks.to_string());
     Ok(())
+}
+
+fn ward_off(discover: Option<PathBuf>, json: bool) -> Result<()> {
+    if crate::human::is_human_terminal() {
+        let _ = crate::human::send_guardian_shutdown();
+    }
+
+    let revoked = grants::revoke_session_grants()?;
+    let cleared_unlocks = unlock::clear_all_unlocks()?;
+    broker::stop()?;
+    global_disable::disable("ward off")?;
+
+    let targets = collect_ward_off_targets(discover.as_deref())?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let passphrase = if targets.is_empty() {
+        None
+    } else {
+        Some(vault::read_existing_passphrase()?)
+    };
+
+    let mut projects = Vec::new();
+    for target in targets {
+        projects.push(restore_ward_off_target(
+            &target,
+            passphrase.as_deref().unwrap_or_default(),
+            &timestamp,
+        ));
+    }
+
+    let restored = projects
+        .iter()
+        .filter(|project| project.status == "restored")
+        .count();
+    let skipped = projects
+        .iter()
+        .filter(|project| project.status == "skipped")
+        .count();
+    let failed = projects
+        .iter()
+        .filter(|project| project.status == "failed")
+        .count();
+
+    let summary = WardOffSummary {
+        disabled: true,
+        disabled_path: global_disable::disabled_path(),
+        restored,
+        skipped,
+        failed,
+        revoked_session_grants: revoked,
+        cleared_unlock_sessions: cleared_unlocks,
+        projects,
+    };
+
+    let event = WardOffEvent {
+        event_type: "ward.off",
+        disabled_path: &summary.disabled_path,
+        restored,
+        skipped,
+        failed,
+        revoked_session_grants: revoked,
+        cleared_unlock_sessions: cleared_unlocks,
+    };
+    audit_logs::append_event(LogKind::Sessions, event)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        term::section("Global");
+        term::ok(&format!(
+            "Ward disabled  {}",
+            term::short_path(&summary.disabled_path)
+        ));
+        term::section("Runtime");
+        term::ok(&format!("revoked {revoked} session grant(s)"));
+        term::ok(&format!("cleared {cleared_unlocks} unlock session(s)"));
+        term::section("Env files");
+        if summary.projects.is_empty() {
+            term::warn("no known Ward projects found");
+        }
+        for project in &summary.projects {
+            match project.status.as_str() {
+                "restored" => term::ok(&format!(
+                    "{}  {}",
+                    project.project,
+                    project
+                        .output
+                        .as_deref()
+                        .map(term::short_path)
+                        .unwrap_or_else(|| "no output".to_string())
+                )),
+                "skipped" => term::warn(&format!("{}  {}", project.project, project.message)),
+                _ => term::fail(&format!("{}  {}", project.project, project.message)),
+            }
+        }
+        term::info(&format!(
+            "{restored} restored, {skipped} skipped, {failed} failed"
+        ));
+    }
+
+    Ok(())
+}
+
+fn ward_on(json: bool) -> Result<()> {
+    let removed = global_disable::enable()?;
+    let summary = WardOnSummary {
+        disabled: false,
+        disabled_path: global_disable::disabled_path(),
+        removed_disabled_state: removed,
+    };
+    let event = WardOnEvent {
+        event_type: "ward.on",
+        disabled_path: &summary.disabled_path,
+        removed_disabled_state: removed,
+    };
+    audit_logs::append_event(LogKind::Sessions, event)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "Ward enabled. Plaintext .env files may still exist; run ward env lock when ready."
+        );
+    }
+    Ok(())
+}
+
+fn collect_ward_off_targets(discover: Option<&Path>) -> Result<Vec<WardOffTarget>> {
+    let mut targets: BTreeMap<(String, PathBuf), WardOffTarget> = BTreeMap::new();
+    collect_registry_off_targets(&mut targets)?;
+    collect_config_backup_off_targets(&mut targets)?;
+    if let Some(root) = discover {
+        collect_discovered_off_targets(&mut targets, root)?;
+    }
+    Ok(targets.into_values().collect())
+}
+
+fn collect_registry_off_targets(
+    targets: &mut BTreeMap<(String, PathBuf), WardOffTarget>,
+) -> Result<()> {
+    let Ok(registry) = registry::list_projects() else {
+        return Ok(());
+    };
+    for (project, registered) in registry.projects {
+        add_ward_off_target(
+            targets,
+            WardOffTarget {
+                project,
+                path: registered.path.clone(),
+                config: config::read_project_config(&registered.path).ok(),
+                registered_vault: Some(registered.vault),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn collect_config_backup_off_targets(
+    targets: &mut BTreeMap<(String, PathBuf), WardOffTarget>,
+) -> Result<()> {
+    let dir = config::config_backups_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(backup) = serde_json::from_str::<config::ProjectConfigBackup>(&contents) else {
+            continue;
+        };
+        add_ward_off_target(
+            targets,
+            WardOffTarget {
+                project: backup.project,
+                path: backup.project_path,
+                config: Some(backup.config),
+                registered_vault: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn collect_discovered_off_targets(
+    targets: &mut BTreeMap<(String, PathBuf), WardOffTarget>,
+    root: &Path,
+) -> Result<()> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !root.exists() {
+        anyhow::bail!("discover root does not exist: {}", root.display());
+    }
+    let mut stack = vec![root];
+    while let Some(path) = stack.pop() {
+        let config_path = config::config_path(&path);
+        let default_vault = path.join(config::DEFAULT_VAULT_FILE);
+        if let Ok(project_config) = config::read_project_config(&path) {
+            add_ward_off_target(
+                targets,
+                WardOffTarget {
+                    project: project_config.project.clone(),
+                    path: path.clone(),
+                    config: Some(project_config),
+                    registered_vault: default_vault.exists().then_some(default_vault),
+                },
+            );
+        } else if default_vault.exists() && !config_path.exists() {
+            let project = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+                .to_string();
+            add_ward_off_target(
+                targets,
+                WardOffTarget {
+                    project,
+                    path: path.clone(),
+                    config: None,
+                    registered_vault: Some(default_vault),
+                },
+            );
+        }
+
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                ".git" | ".ward" | "node_modules" | "target" | ".next" | ".turbo"
+            ) {
+                continue;
+            }
+            stack.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn add_ward_off_target(
+    targets: &mut BTreeMap<(String, PathBuf), WardOffTarget>,
+    target: WardOffTarget,
+) {
+    let key = ward_off_target_key(&target.project, &target.path);
+    targets
+        .entry(key)
+        .and_modify(|existing| {
+            if existing.config.is_none() {
+                existing.config = target.config.clone();
+            }
+            if existing.registered_vault.is_none() {
+                existing.registered_vault = target.registered_vault.clone();
+            }
+        })
+        .or_insert(target);
+}
+
+fn ward_off_target_key(project: &str, path: &Path) -> (String, PathBuf) {
+    (
+        project.to_string(),
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+    )
+}
+
+fn restore_ward_off_target(
+    target: &WardOffTarget,
+    passphrase: &str,
+    timestamp: &str,
+) -> WardOffProjectStatus {
+    let vault = resolve_ward_off_vault_path(target, passphrase);
+    if !target.path.is_dir() {
+        return WardOffProjectStatus {
+            project: target.project.clone(),
+            path: target.path.clone(),
+            vault: Some(vault),
+            output: None,
+            status: "skipped".to_string(),
+            message: "project path missing".to_string(),
+        };
+    }
+    if !vault.exists() {
+        return WardOffProjectStatus {
+            project: target.project.clone(),
+            path: target.path.clone(),
+            vault: Some(vault),
+            output: None,
+            status: "skipped".to_string(),
+            message: "vault missing".to_string(),
+        };
+    }
+
+    let env_path = target.path.join(".env");
+    match env_file::unlock_env_file_preserving_plaintext(&env_path, &vault, passphrase, timestamp) {
+        Ok(output) => WardOffProjectStatus {
+            project: target.project.clone(),
+            path: target.path.clone(),
+            vault: Some(vault),
+            output: Some(output),
+            status: "restored".to_string(),
+            message: "plaintext env written".to_string(),
+        },
+        Err(error) => WardOffProjectStatus {
+            project: target.project.clone(),
+            path: target.path.clone(),
+            vault: Some(vault),
+            output: None,
+            status: "failed".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
+fn resolve_ward_off_vault_path(target: &WardOffTarget, passphrase: &str) -> PathBuf {
+    let mut candidates = Vec::new();
+    if let Ok(project_config) = config::read_project_config(&target.path) {
+        push_unique_path(
+            &mut candidates,
+            config::resolve_vault_path_with_passphrase(&target.path, &project_config, passphrase),
+        );
+        push_unique_path(
+            &mut candidates,
+            config::resolve_vault_path(&target.path, &project_config),
+        );
+    }
+    if let Some(project_config) = target.config.as_ref() {
+        push_unique_path(
+            &mut candidates,
+            config::resolve_vault_path_with_passphrase(&target.path, project_config, passphrase),
+        );
+        push_unique_path(
+            &mut candidates,
+            config::resolve_vault_path(&target.path, project_config),
+        );
+    }
+    if let Some(vault) = target.registered_vault.as_ref() {
+        push_unique_path(&mut candidates, vault.clone());
+    }
+    push_unique_path(
+        &mut candidates,
+        target.path.join(config::DEFAULT_VAULT_FILE),
+    );
+
+    candidates
+        .iter()
+        .find(|candidate| candidate.exists())
+        .cloned()
+        .unwrap_or_else(|| {
+            candidates
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| target.path.join(config::DEFAULT_VAULT_FILE))
+        })
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| same_path(existing, &path)) {
+        paths.push(path);
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right || left.canonicalize().ok() == right.canonicalize().ok()
 }
 
 fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
@@ -6010,6 +6459,7 @@ fn is_safe_shell_function_name(name: &str) -> bool {
 
 fn shell_init_code(shell: &str) -> String {
     let ward_home = audit_logs::ward_home();
+    let disabled_path = ward_home.join("disabled.json").display().to_string();
     let sock_path = ward_home
         .join("run")
         .join("human-$$/guardian.sock")
@@ -6021,21 +6471,25 @@ fn shell_init_code(shell: &str) -> String {
     let cmds_ref: Vec<&str> = cmds.iter().map(String::as_str).collect();
 
     if shell == "fish" {
-        fish_init_code(&ward_home, &cmds_ref)
+        fish_init_code(&ward_home, &disabled_path, &cmds_ref)
     } else {
-        posix_init_code(shell, &ward_home, &sock_path, &cmds_ref)
+        posix_init_code(shell, &ward_home, &disabled_path, &sock_path, &cmds_ref)
     }
 }
 
 fn posix_init_code(
     shell: &str,
     ward_home: &std::path::Path,
+    disabled_path: &str,
     sock_path: &str,
     cmds: &[&str],
 ) -> String {
     let mut out =
         String::from("# ward shell integration — only active in human mode inside ward projects\n");
     out.push_str("export WARD_SHELL_INTEGRATION=1\n");
+    out.push_str("__ward_disabled() {\n");
+    out.push_str(&format!("  [ -f \"{disabled_path}\" ]\n"));
+    out.push_str("}\n");
     out.push_str("__ward_project_root() {\n");
     out.push_str("  __ward_dir=\"$PWD\"\n");
     out.push_str("  while [ -n \"$__ward_dir\" ]; do\n");
@@ -6067,14 +6521,19 @@ fn posix_init_code(
     out.push_str("__ward_app_from_command() {\n");
     out.push_str("  case \"$1\" in\n");
     out.push_str("    pnpm|npm|yarn|bun)\n");
+    out.push_str("      __ward_manager=\"$1\"\n");
     out.push_str("      shift\n");
+    out.push_str("      if [ \"$__ward_manager\" = \"yarn\" ] && [ \"$1\" = \"workspace\" ] && [ -n \"$2\" ]; then\n");
+    out.push_str("        printf '%s\\n' \"$2\"\n");
+    out.push_str("        return 0\n");
+    out.push_str("      fi\n");
     out.push_str("      while [ $# -gt 0 ]; do\n");
     out.push_str("        case \"$1\" in\n");
-    out.push_str("          --filter|--workspace)\n");
+    out.push_str("          --filter|--workspace|-F|-w)\n");
     out.push_str("            shift\n");
     out.push_str("            [ -n \"$1\" ] && printf '%s\\n' \"$1\" && return 0\n");
     out.push_str("            ;;\n");
-    out.push_str("          --filter=*|--workspace=*)\n");
+    out.push_str("          --filter=*|--workspace=*|-F=*|-w=*)\n");
     out.push_str("            printf '%s\\n' \"${1#*=}\"\n");
     out.push_str("            return 0\n");
     out.push_str("            ;;\n");
@@ -6086,6 +6545,10 @@ fn posix_init_code(
     out.push_str("  return 1\n");
     out.push_str("}\n");
     out.push_str("__ward_wrap() {\n");
+    out.push_str("  if __ward_disabled; then\n");
+    out.push_str("    command \"$@\"\n");
+    out.push_str("    return $?\n");
+    out.push_str("  fi\n");
     out.push_str("  __ward_root=\"$(__ward_project_root)\"\n");
     out.push_str("  __ward_workspace=\"$(__ward_workspace_root)\"\n");
     out.push_str("  if [ -z \"$__ward_root\" ] && [ -z \"$__ward_workspace\" ]; then\n");
@@ -6117,7 +6580,7 @@ fn posix_init_code(
     out.push_str("  return 126\n");
     out.push_str("}\n");
     if shell == "zsh" {
-        out.push_str(&zsh_prompt_badge_code(sock_path));
+        out.push_str(&zsh_prompt_badge_code(&disabled_path, sock_path));
     }
     let reload_marker = ward_home
         .join("run")
@@ -6147,12 +6610,15 @@ fn posix_init_code(
     out
 }
 
-fn zsh_prompt_badge_code(sock_path: &str) -> String {
+fn zsh_prompt_badge_code(disabled_path: &str, sock_path: &str) -> String {
     let mut out = String::new();
     out.push_str("if [ -n \"${ZSH_VERSION:-}\" ]; then\n");
     out.push_str("__WARD_HUMAN_BADGE='%F{135}◬ ward:human%f'\n");
     out.push_str("__WARD_LOCKED_BADGE='%F{244}ward:locked%f'\n");
     out.push_str("__ward_prompt_badge() {\n");
+    out.push_str(&format!("  if [ -f \"{disabled_path}\" ]; then\n"));
+    out.push_str("    return 0\n");
+    out.push_str("  fi\n");
     out.push_str("  __ward_root=\"$(__ward_project_root)\"\n");
     out.push_str("  __ward_workspace=\"$(__ward_workspace_root)\"\n");
     out.push_str("  if [ -z \"$__ward_root\" ] && [ -z \"$__ward_workspace\" ]; then\n");
@@ -6197,11 +6663,14 @@ fn zsh_prompt_badge_code(sock_path: &str) -> String {
     out
 }
 
-fn fish_init_code(ward_home: &std::path::Path, cmds: &[&str]) -> String {
+fn fish_init_code(ward_home: &std::path::Path, disabled_path: &str, cmds: &[&str]) -> String {
     let sock_dir = ward_home.join("run").display().to_string();
     let mut out =
         String::from("# ward shell integration — only active in human mode inside ward projects\n");
     out.push_str("set -gx WARD_SHELL_INTEGRATION 1\n");
+    out.push_str("function __ward_disabled\n");
+    out.push_str(&format!("    test -f \"{disabled_path}\"\n"));
+    out.push_str("end\n");
     out.push_str("function __ward_project_root\n");
     out.push_str("    set dir (pwd)\n");
     out.push_str("    while test -n \"$dir\"\n");
@@ -6235,18 +6704,23 @@ fn fish_init_code(ward_home: &std::path::Path, cmds: &[&str]) -> String {
     out.push_str("function __ward_app_from_command\n");
     out.push_str("    switch $argv[1]\n");
     out.push_str("        case pnpm npm yarn bun\n");
+    out.push_str("            set manager $argv[1]\n");
     out.push_str("            set args $argv[2..-1]\n");
+    out.push_str("            if test \"$manager\" = \"yarn\"; and test \"$args[1]\" = \"workspace\"; and test -n \"$args[2]\"\n");
+    out.push_str("                echo $args[2]\n");
+    out.push_str("                return 0\n");
+    out.push_str("            end\n");
     out.push_str("            set i 1\n");
     out.push_str("            while test $i -le (count $args)\n");
     out.push_str("                set arg $args[$i]\n");
     out.push_str(
-        "                if test \"$arg\" = \"--filter\"; or test \"$arg\" = \"--workspace\"\n",
+        "                if test \"$arg\" = \"--filter\"; or test \"$arg\" = \"--workspace\"; or test \"$arg\" = \"-F\"; or test \"$arg\" = \"-w\"\n",
     );
     out.push_str("                    set i (math $i + 1)\n");
     out.push_str(
         "                    test $i -le (count $args); and echo $args[$i]; and return 0\n",
     );
-    out.push_str("                else if string match -q -- '--filter=*' $arg; or string match -q -- '--workspace=*' $arg\n");
+    out.push_str("                else if string match -q -- '--filter=*' $arg; or string match -q -- '--workspace=*' $arg; or string match -q -- '-F=*' $arg; or string match -q -- '-w=*' $arg\n");
     out.push_str("                    string replace -r '^[^=]+=' '' $arg\n");
     out.push_str("                    return 0\n");
     out.push_str("                end\n");
@@ -6260,6 +6734,10 @@ fn fish_init_code(ward_home: &std::path::Path, cmds: &[&str]) -> String {
     out.push_str(&format!(
         "    set sock \"{sock_dir}/human-$fish_pid/guardian.sock\"\n"
     ));
+    out.push_str("    if __ward_disabled\n");
+    out.push_str("        command $argv\n");
+    out.push_str("        return $status\n");
+    out.push_str("    end\n");
     out.push_str("    set project_root (__ward_project_root)\n");
     out.push_str("    set workspace_root (__ward_workspace_root)\n");
     out.push_str("    if test -z \"$project_root\"; and test -z \"$workspace_root\"\n");
@@ -6579,6 +7057,26 @@ fn split_profile_command(command: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn plan_resolved_profile(
+    plan: &workspace_target::WorkspaceExecutionPlan,
+    mut profile: ResolvedProfile,
+    from_profile: bool,
+) -> Result<PlannedProfile> {
+    let policy_command = profile.command.clone();
+    let mounted = if from_profile {
+        workspace_target::mount_profile_command(plan, &profile.command_args)?
+    } else {
+        workspace_target::mount_command(plan, &profile.command_args)?
+    };
+    profile.command = mounted.display;
+    profile.command_args = mounted.argv;
+    Ok(PlannedProfile {
+        profile,
+        policy_command,
+        mounted: mounted.mounted,
+    })
+}
+
 fn effective_grant_id(
     decision: &ApprovalDecision,
     persisted_grant: Option<&grants::ApprovalGrant>,
@@ -6623,13 +7121,27 @@ fn log_anomaly_alerts(config: &config::ProjectConfig, grant_id: Option<uuid::Uui
     Ok(())
 }
 
+#[allow(dead_code)]
 fn evaluate_access(
     config: &config::ProjectConfig,
     access: &AccessRequest,
 ) -> policy::PolicyEvaluation {
+    evaluate_access_with_policy_command(config, access, &access.command)
+}
+
+fn evaluate_access_with_policy_command(
+    config: &config::ProjectConfig,
+    access: &AccessRequest,
+    policy_command: &str,
+) -> policy::PolicyEvaluation {
     let findings =
         detection::preflight_findings(&access.command, &access.env, access.action.as_deref());
-    policy::evaluate_request(config, access, None, findings)
+    if policy_command == access.command {
+        return policy::evaluate_request(config, access, None, findings);
+    }
+    let mut policy_access = access.clone();
+    policy_access.command = policy_command.to_string();
+    policy::evaluate_request(config, &policy_access, None, findings)
 }
 
 fn request_audit_snapshot<'a>(
@@ -8418,7 +8930,9 @@ mod tests {
         let _guard = cwd_lock();
         let old_cwd = std::env::current_dir().unwrap();
         let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
+        std::env::set_var("WARD_HOME", home.path());
 
         let dispatch_conflict = dispatch(Cli {
             command: Commands::Setup {
@@ -10046,6 +10560,71 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn ward_off_target_collection_dedupes_registry_backup_and_discovery() {
+        let _guard = cwd_lock();
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+
+        let config =
+            ProjectConfig::default_for_dir(project.path(), Some("demo".to_string())).unwrap();
+        config::write_project_config(project.path(), &config, false).unwrap();
+        registry::register_project(
+            "demo".to_string(),
+            project.path().to_path_buf(),
+            project.path().join(config::DEFAULT_VAULT_FILE),
+        )
+        .unwrap();
+
+        let targets = collect_ward_off_targets(Some(project.path())).unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].project, "demo");
+        assert!(same_path(&targets[0].path, project.path()));
+        assert!(targets[0].config.is_some());
+        assert!(targets[0].registered_vault.is_some());
+
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shell_init_checks_disabled_state_before_project_detection() {
+        let _guard = cwd_lock();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+
+        let posix = shell_init_code("zsh");
+        let disabled_check = posix.find("if __ward_disabled").unwrap();
+        let project_detection = posix
+            .find("__ward_root=\"$(__ward_project_root)\"")
+            .unwrap();
+        assert!(disabled_check < project_detection);
+        assert!(posix.contains("__ward_disabled()"));
+        assert!(posix.contains("disabled.json"));
+        assert!(posix.contains("command \"$@\""));
+        assert!(posix.contains("WARD_HUMAN_SHELL_PID=$$ command ward \"$@\""));
+        assert!(posix.contains("--filter|--workspace|-F|-w"));
+        assert!(posix.contains("[ \"$__ward_manager\" = \"yarn\" ] && [ \"$1\" = \"workspace\" ]"));
+        assert!(posix.contains("__ward_prompt_badge()"));
+        assert!(posix.contains("if [ -f \""));
+
+        let fish = shell_init_code("fish");
+        let disabled_check = fish.find("if __ward_disabled").unwrap();
+        let project_detection = fish.find("set project_root (__ward_project_root)").unwrap();
+        assert!(disabled_check < project_detection);
+        assert!(fish.contains("function __ward_disabled"));
+        assert!(fish.contains("test -f \""));
+        assert!(fish.contains("command $argv"));
+        assert!(fish.contains("env WARD_HUMAN_SHELL_PID=$fish_pid command ward $argv"));
+        assert!(fish.contains("test \"$manager\" = \"yarn\""));
+        assert!(fish.contains("or test \"$arg\" = \"-F\"; or test \"$arg\" = \"-w\""));
+
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
     fn check_gitignore_reports_read_errors() {
         let tempdir = tempfile::tempdir().unwrap();
         std::fs::create_dir(tempdir.path().join(".gitignore")).unwrap();
@@ -10748,6 +11327,9 @@ mod tests {
             vec!["ward", "edit"],
             vec!["ward", "unlock", "--ttl", "1h"],
             vec!["ward", "lock"],
+            vec!["ward", "off"],
+            vec!["ward", "off", "--discover", "."],
+            vec!["ward", "on", "--json"],
             vec![
                 "ward",
                 "teardown",
@@ -11003,6 +11585,14 @@ mod tests {
             ),
             format!(
                 "{:?}",
+                Commands::Off {
+                    discover: Some(".".into()),
+                    json: true,
+                }
+            ),
+            format!("{:?}", Commands::On { json: true }),
+            format!(
+                "{:?}",
                 GrantsCommand::Revoke {
                     grant_id: request_id
                 }
@@ -11048,7 +11638,7 @@ mod tests {
             format!("{:?}", DashboardCommand::Tui),
         ];
 
-        assert_eq!(commands.len(), 35);
+        assert_eq!(commands.len(), 37);
         for value in commands {
             assert!(!value.is_empty());
         }
@@ -11060,9 +11650,6 @@ mod tests {
         assert!(SETUP_GUIDED_BODY.contains("safe human and agent access"));
         assert!(WORKSPACE_SETUP_BODY.contains("monorepo workspace"));
         assert!(WORKSPACE_SETUP_PROMPT_HELP.contains("workspace-root trust"));
-        assert_eq!(RECOVERY_EXPORT_PROMPT, "Export a recovery backup now?");
-        assert!(RECOVERY_EXPORT_HELP.contains("USB drive"));
-        assert!(RECOVERY_EXPORT_HELP.contains("secure cloud backup"));
     }
 
     #[cfg(unix)]

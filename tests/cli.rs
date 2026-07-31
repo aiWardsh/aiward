@@ -88,9 +88,11 @@ impl TestProject {
             .assert()
             .success()
             .stderr(
-                predicate::str::contains(".env encrypted")
-                    .and(predicate::str::contains("unlocked until"))
-                    .and(predicate::str::contains("recovery key created")),
+                predicate::str::contains("vault encrypted")
+                    .and(predicate::str::contains("session unlocked"))
+                    .and(predicate::str::contains(
+                        "vault recoverable with .env.vault + PIN/passphrase",
+                    )),
             );
     }
 
@@ -184,6 +186,25 @@ impl TestProject {
             env::var("PATH").unwrap_or_default()
         )
     }
+}
+
+fn setup_project_with_home(path: &Path, ward_home: &Path, project: &str, passphrase: &str) {
+    std::fs::write(path.join(".gitignore"), ".env\n.env.*\n").unwrap();
+    std::fs::write(
+        path.join(".env"),
+        format!("DATABASE_URL=postgres://{project}\nPAYLOAD_SECRET={project}-secret\n"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(path)
+        .env("WARD_HOME", ward_home)
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", passphrase)
+        .args(["setup", "--yes", "--project", project])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -352,6 +373,83 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("already an Ward locked marker"));
+}
+
+#[test]
+fn off_disables_ward_restores_plaintext_env_and_on_reenables_without_deleting_files() {
+    let fixture = TestProject::new();
+
+    fixture.setup_yes();
+    assert!(fixture.project_dir.path().join(".ward.json").exists());
+    assert!(fixture.project_dir.path().join(".env.vault").exists());
+    assert!(ward::env_file::is_locked_env_file(&fixture.project_dir.path().join(".env")).unwrap());
+
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["off", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"disabled\": true")
+                .and(predicate::str::contains("\"restored\": 1"))
+                .and(predicate::str::contains("\"failed\": 0")),
+        );
+
+    assert!(fixture.ward_home.path().join("disabled.json").exists());
+    assert!(fixture.project_dir.path().join(".ward.json").exists());
+    assert!(fixture.project_dir.path().join(".env.vault").exists());
+    let env_contents = std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
+    assert!(env_contents.contains("Ward unlocked plaintext .env"));
+    assert!(env_contents.contains("DATABASE_URL=postgres://secret"));
+    assert!(env_contents.contains("PAYLOAD_SECRET=payload-secret"));
+    assert!(!env_contents.contains("WARD_LOCKED=1"));
+
+    fixture
+        .command()
+        .args(["on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Ward enabled. Plaintext .env files may still exist; run ward env lock when ready.",
+        ));
+
+    assert!(!fixture.ward_home.path().join("disabled.json").exists());
+    assert!(fixture.project_dir.path().join(".ward.json").exists());
+    assert!(fixture.project_dir.path().join(".env.vault").exists());
+    let env_contents_after_on =
+        std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
+    assert!(env_contents_after_on.contains("DATABASE_URL=postgres://secret"));
+}
+
+#[test]
+fn off_restores_multiple_registered_projects_and_continues_after_wrong_pin_failure() {
+    let ward_home = tempfile::tempdir().unwrap();
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+
+    setup_project_with_home(project_a.path(), ward_home.path(), "alpha", "1234");
+    setup_project_with_home(project_b.path(), ward_home.path(), "bravo", "9876");
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(project_a.path())
+        .env("WARD_HOME", ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", "1234")
+        .args(["off", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"disabled\": true")
+                .and(predicate::str::contains("\"restored\": 1"))
+                .and(predicate::str::contains("\"failed\": 1")),
+        );
+
+    assert!(ward_home.path().join("disabled.json").exists());
+    let restored = std::fs::read_to_string(project_a.path().join(".env")).unwrap();
+    assert!(restored.contains("DATABASE_URL=postgres://alpha"));
+    assert!(ward::env_file::is_locked_env_file(&project_b.path().join(".env")).unwrap());
 }
 
 #[test]
@@ -607,7 +705,7 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
         .assert()
         .success()
         .stderr(
-            predicate::str::contains("Workspace: cms-core")
+            predicate::str::contains("Workspace")
                 .and(predicate::str::contains(
                     "core-workbench configured as cms-core:core-workbench",
                 ))
@@ -638,7 +736,7 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
         .args(["projects", "show"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Project: cms-core:core-workbench"));
+        .stderr(predicate::str::contains("cms-core:core-workbench"));
 
     let output = Command::cargo_bin("ward")
         .unwrap()
@@ -676,9 +774,10 @@ fn setup_yes_auto_detects_workspace_apps_from_monorepo_root() {
         .assert()
         .success()
         .stderr(
-            predicate::str::contains("Workspace: cms-core")
+            predicate::str::contains("Workspace")
                 .and(predicate::str::contains("2 app(s) ready to configure"))
-                .and(predicate::str::contains("ambienta  needs .env"))
+                .and(predicate::str::contains("ambienta"))
+                .and(predicate::str::contains("needs .env"))
                 .and(predicate::str::contains(
                     "core-workbench configured as cms-core:core-workbench",
                 ))
@@ -763,7 +862,7 @@ fn workspace_root_env_and_doctor_are_app_target_aware() {
         .assert()
         .success()
         .stderr(
-            predicate::str::contains("Workspace")
+            predicate::str::contains("workspace")
                 .and(predicate::str::contains("core-workbench"))
                 .and(predicate::str::contains("creativestudio")),
         );
@@ -777,7 +876,7 @@ fn workspace_root_env_and_doctor_are_app_target_aware() {
         .args(["env", "unlock", "--app", "core-workbench", "--force"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("apps/core-workbench/.env"));
+        .stderr(predicate::str::contains("core-workbench/.env"));
 
     let plaintext_env =
         std::fs::read_to_string(root.path().join("apps/core-workbench/.env")).unwrap();
@@ -786,7 +885,7 @@ fn workspace_root_env_and_doctor_are_app_target_aware() {
 }
 
 #[test]
-fn workspace_run_app_profile_executes_from_selected_app_directory() {
+fn workspace_run_app_profile_executes_from_workspace_root_with_mounted_command() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     write_monorepo_fixture(root.path());
@@ -802,14 +901,16 @@ fn workspace_run_app_profile_executes_from_selected_app_directory() {
         .success();
 
     let cwd_file = root.path().join("run-cwd.txt");
+    let args_file = root.path().join("run-args.txt");
     let bin_dir = root.path().join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let pnpm = bin_dir.join("pnpm");
     std::fs::write(
         &pnpm,
         format!(
-            "#!/bin/sh\npwd > '{}'\nprintf 'dev ok %s\\n' \"$DATABASE_URI\"\n",
-            cwd_file.display()
+            "#!/bin/sh\npwd > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'dev ok %s\\n' \"$DATABASE_URI\"\n",
+            cwd_file.display(),
+            args_file.display()
         ),
     )
     .unwrap();
@@ -843,7 +944,11 @@ fn workspace_run_app_profile_executes_from_selected_app_directory() {
         .clone();
     let response: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(response["project"], "cms-core:core-workbench");
-    let request_id = response["requestId"].as_str().unwrap();
+    assert_eq!(
+        response["command"],
+        "pnpm --filter @cms-app/core-workbench dev"
+    );
+    assert_eq!(response["matchedProfile"], "dev");
 
     Command::cargo_bin("ward")
         .unwrap()
@@ -859,30 +964,9 @@ fn workspace_run_app_profile_executes_from_selected_app_directory() {
         .unwrap()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "branch",
-            "--agent-mediated",
-        ])
-        .assert()
-        .success();
-
-    Command::cargo_bin("ward")
-        .unwrap()
-        .current_dir(root.path())
-        .env("WARD_HOME", home.path())
         .env("PATH", &path)
-        .args([
-            "run",
-            "--app",
-            "core-workbench",
-            "--profile",
-            "dev",
-            "--json",
-            "--no-prompt",
-        ])
+        .env("WARD_UNSAFE_TEST_APPROVAL", "branch")
+        .args(["run", "--app", "core-workbench", "--profile", "dev"])
         .args(&context)
         .assert()
         .success()
@@ -891,11 +975,119 @@ fn workspace_run_app_profile_executes_from_selected_app_directory() {
     let observed_cwd = std::fs::read_to_string(cwd_file).unwrap();
     assert_eq!(
         PathBuf::from(observed_cwd.trim()).canonicalize().unwrap(),
-        root.path()
-            .join("apps/core-workbench")
-            .canonicalize()
-            .unwrap()
+        root.path().canonicalize().unwrap()
     );
+    let observed_args = std::fs::read_to_string(args_file).unwrap();
+    assert_eq!(
+        observed_args.lines().collect::<Vec<_>>(),
+        vec!["--filter", "@cms-app/core-workbench", "dev"]
+    );
+}
+
+#[test]
+fn workspace_run_profile_infers_app_from_nested_directory_and_executes_from_root() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_monorepo_fixture(root.path());
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["setup", "--yes"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["unlock", "--app", "core-workbench", "--ttl", "1h"])
+        .assert()
+        .success();
+
+    let nested = root.path().join("apps/core-workbench/src");
+    std::fs::create_dir_all(&nested).unwrap();
+    let cwd_file = root.path().join("nested-run-cwd.txt");
+    let args_file = root.path().join("nested-run-args.txt");
+    let bin_dir = root.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let pnpm = bin_dir.join("pnpm");
+    std::fs::write(
+        &pnpm,
+        format!(
+            "#!/bin/sh\npwd > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'nested ok %s\\n' \"$PAYLOAD_SECRET\"\n",
+            cwd_file.display(),
+            args_file.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&pnpm);
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(&nested)
+        .env("WARD_HOME", home.path())
+        .env("PATH", &path)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "always")
+        .args([
+            "run",
+            "--agent",
+            "codex",
+            "--branch",
+            "main",
+            "--profile",
+            "dev",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nested ok [WARD_REDACTED]"));
+
+    let observed_cwd = std::fs::read_to_string(cwd_file).unwrap();
+    assert_eq!(
+        PathBuf::from(observed_cwd.trim()).canonicalize().unwrap(),
+        root.path().canonicalize().unwrap()
+    );
+    let observed_args = std::fs::read_to_string(args_file).unwrap();
+    assert_eq!(
+        observed_args.lines().collect::<Vec<_>>(),
+        vec!["--filter", "@cms-app/core-workbench", "dev"]
+    );
+}
+
+#[test]
+fn workspace_run_from_ambiguous_root_requires_app_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_monorepo_fixture(root.path());
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["setup", "--yes"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .args(["run", "--agent", "codex", "--profile", "dev"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("choose one with --app <app>"));
 }
 
 #[test]
@@ -976,6 +1168,10 @@ fn shell_init_wraps_common_dev_commands_even_outside_project() {
                 ))
                 .and(predicate::str::contains("__ward_workspace_root()"))
                 .and(predicate::str::contains("__ward_app_from_command()"))
+                .and(predicate::str::contains("--filter|--workspace|-F|-w"))
+                .and(predicate::str::contains(
+                    "[ \"$__ward_manager\" = \"yarn\" ] && [ \"$1\" = \"workspace\" ]",
+                ))
                 .and(predicate::str::contains("command ward run -- \"$@\""))
                 .and(predicate::str::contains(
                     "command ward run --app \"$__ward_app\" -- \"$@\"",
@@ -1133,6 +1329,56 @@ fn zsh_ward_project_without_guardian_fails_closed_before_pnpm() {
     assert_eq!(output.status.code(), Some(126));
     assert!(!marker.exists());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Ward human mode is not active"));
+}
+
+#[test]
+fn zsh_ward_project_disabled_passes_through_without_guardian() {
+    if zsh_unavailable() {
+        return;
+    }
+    let fixture = TestProject::new();
+    let ward_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.project_dir.path().join(".ward.json"),
+        r#"{"version":1,"project":"demo","vault":".env.vault"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ward_home.path().join("disabled.json"),
+        r#"{"version":1,"disabledAt":"2026-07-31T00:00:00Z","reason":"ward off"}"#,
+    )
+    .unwrap();
+    let marker = fixture.project_dir.path().join("pnpm-ran-disabled");
+    let fake_path = fixture.fake_pnpm_path(&format!(
+        "#!/bin/sh\nprintf ran > '{}'\nexit 0\n",
+        marker.display()
+    ));
+    let ward_bin_dir = ward_bin_dir();
+    let rc = fixture.project_dir.path().join("disabled.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\npnpm run dev\n",
+            ward_bin_dir.display(),
+            fake_path
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", ward_home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker.exists());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Ward human mode is not active"));
 }
 
 #[test]

@@ -108,6 +108,33 @@ pub fn ensure_project_key(project: &str, passphrase: &str) -> Result<ApprovalKey
         return Ok(key_file);
     }
 
+    create_project_key(project, passphrase)
+}
+
+/// Ensures approval-signing material after the vault PIN/passphrase has already
+/// decrypted the vault successfully. At that point a missing or unreadable
+/// approval key should not block env access; regenerate it and let old receipts
+/// fail verification naturally against the new public key.
+pub fn ensure_project_key_after_vault_unlock(
+    project: &str,
+    passphrase: &str,
+) -> Result<ApprovalKeyFile> {
+    match ensure_project_key(project, passphrase) {
+        Ok(key_file) => Ok(key_file),
+        Err(original_error) => {
+            archive_project_key_if_present(project).with_context(|| {
+                format!(
+                    "failed to archive unusable approval key after vault unlock: {original_error}"
+                )
+            })?;
+            create_project_key(project, passphrase).with_context(|| {
+                format!("failed to regenerate approval key after vault unlock: {original_error}")
+            })
+        }
+    }
+}
+
+fn create_project_key(project: &str, passphrase: &str) -> Result<ApprovalKeyFile> {
     let mut seed = [0_u8; SIGNING_SEED_LEN];
     OsRng.fill_bytes(&mut seed);
     let signing_key = SigningKey::from_bytes(&seed);
@@ -126,6 +153,28 @@ pub fn ensure_project_key(project: &str, passphrase: &str) -> Result<ApprovalKey
     };
     write_project_key(&key_file)?;
     Ok(key_file)
+}
+
+fn archive_project_key_if_present(project: &str) -> Result<()> {
+    let path = project_key_path(project);
+    if !path.exists() {
+        return Ok(());
+    }
+    let timestamp = Utc::now()
+        .timestamp_nanos_opt()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| Utc::now().timestamp_millis().to_string());
+    let archive = keys_dir().join(format!(
+        "{}.invalid-{timestamp}.json",
+        project_path_id(project)
+    ));
+    std::fs::rename(&path, &archive)
+        .or_else(|_| {
+            std::fs::copy(&path, &archive)?;
+            std::fs::remove_file(&path)
+        })
+        .with_context(|| format!("failed to archive {}", path.display()))?;
+    fs_util::set_private_file_permissions(&archive)
 }
 
 pub fn session_signing_key_ciphertext(

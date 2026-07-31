@@ -21,6 +21,34 @@ const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 pub(crate) const MIN_PIN_PASSPHRASE_LEN: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinStrength {
+    Weak,
+    Better,
+    Stronger,
+    Strong,
+}
+
+impl PinStrength {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Weak => "weak",
+            Self::Better => "better",
+            Self::Stronger => "stronger",
+            Self::Strong => "strong",
+        }
+    }
+
+    fn color(self) -> &'static str {
+        match self {
+            Self::Weak => "\x1b[31m",
+            Self::Better => "\x1b[33m",
+            Self::Stronger => "\x1b[36m",
+            Self::Strong => "\x1b[32m",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultEnvelope {
@@ -299,12 +327,48 @@ pub(crate) fn validate_new_passphrase(first: &str, second: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn pin_strength(value: &str) -> PinStrength {
+    match value.chars().count() {
+        0..=5 => PinStrength::Weak,
+        6..=7 => PinStrength::Better,
+        8..=11 => PinStrength::Stronger,
+        _ => PinStrength::Strong,
+    }
+}
+
+pub(crate) fn pin_strength_message(value: &str) -> String {
+    let strength = pin_strength(value);
+    let chars = value.chars().count();
+    let note = match strength {
+        PinStrength::Weak => "quick to type, but weak if the encrypted vault leaks",
+        PinStrength::Better => "still convenient, with a little more resistance",
+        PinStrength::Stronger => "good for daily use",
+        PinStrength::Strong => "best protection for this unlock method",
+    };
+    format!(
+        "  PIN strength: {}{}\x1b[0m ({} chars; {})",
+        strength.color(),
+        strength.label(),
+        chars,
+        note
+    )
+}
+
+#[cfg(not(coverage))]
+fn print_pin_strength(value: &str) {
+    eprintln!("{}", pin_strength_message(value));
+}
+
+#[cfg(coverage)]
+fn print_pin_strength(_value: &str) {}
+
 /// Prompt for a new PIN with custom labels (used for recovery PIN during setup).
 pub fn read_new_pin(prompt: &str, confirm_prompt: &str) -> Result<String> {
     if let Some(passphrase) = test_passphrase() {
         return Ok(passphrase);
     }
     let first = rpassword::prompt_password(format!("{prompt}: "))?;
+    print_pin_strength(&first);
     let second = rpassword::prompt_password(format!("{confirm_prompt}: "))?;
     validate_new_passphrase(&first, &second)?;
     Ok(first)
@@ -347,6 +411,7 @@ pub(crate) fn test_passphrase() -> Option<String> {
 #[cfg(not(coverage))]
 fn prompt_new_passphrase_pair() -> Result<(String, String)> {
     let first = rpassword::prompt_password("  New vault PIN/passphrase: ")?;
+    print_pin_strength(&first);
     let second = rpassword::prompt_password("  Confirm vault PIN/passphrase: ")?;
     Ok((first, second))
 }
@@ -466,6 +531,19 @@ mod tests {
             .to_string();
         assert!(short.contains("PIN/passphrase must be at least 4 characters"));
         assert!(validate_new_passphrase("1234", "4321").is_err());
+    }
+
+    #[test]
+    fn reports_pin_strength_without_blocking_longer_values() {
+        assert_eq!(pin_strength("1234"), PinStrength::Weak);
+        assert_eq!(pin_strength("123456"), PinStrength::Better);
+        assert_eq!(pin_strength("12345678"), PinStrength::Stronger);
+        assert_eq!(pin_strength("correct horse"), PinStrength::Strong);
+
+        let weak = pin_strength_message("1234");
+        assert!(weak.contains("\x1b[31mweak\x1b[0m"));
+        assert!(weak.contains("4 chars"));
+        assert!(validate_new_passphrase("123456789012", "123456789012").is_ok());
     }
 
     #[test]

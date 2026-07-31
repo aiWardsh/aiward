@@ -46,6 +46,43 @@ impl WorkspaceTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecutionPlanOptions {
+    pub profile_command: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceExecutionPlan {
+    pub workspace_root: Option<PathBuf>,
+    pub app_path: PathBuf,
+    pub app_relative_path: Option<PathBuf>,
+    pub app_slug: Option<String>,
+    pub package_name: Option<String>,
+    pub package_scripts: Vec<String>,
+    pub project: String,
+    pub vault: PathBuf,
+    pub execution_cwd: PathBuf,
+    pub workspace_package_manager: Option<String>,
+    pub target: WorkspaceTarget,
+}
+
+impl WorkspaceExecutionPlan {
+    pub fn resolved_project(&self) -> registry::ResolvedProject {
+        self.target.resolved_project()
+    }
+
+    pub fn is_workspace_app(&self) -> bool {
+        self.workspace_root.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountedCommand {
+    pub argv: Vec<String>,
+    pub display: String,
+    pub mounted: bool,
+}
+
 pub fn resolve_one(selector: &TargetSelector, cwd: &Path) -> Result<WorkspaceTarget> {
     if selector.all {
         anyhow::bail!("--all cannot be used where exactly one Ward project is required");
@@ -60,6 +97,127 @@ pub fn resolve_one(selector: &TargetSelector, cwd: &Path) -> Result<WorkspaceTar
         return explicit_app(app, cwd);
     }
     implicit_one(cwd)
+}
+
+pub fn resolve_execution_plan(
+    selector: &TargetSelector,
+    cwd: &Path,
+    options: ExecutionPlanOptions,
+) -> Result<WorkspaceExecutionPlan> {
+    let mut target = resolve_one(selector, cwd)?;
+    let mut workspace_package_manager = None;
+    let mut package_scripts = Vec::new();
+    if target.workspace_root.is_some() || workspace::discover_containing(&target.path)?.is_some() {
+        attach_workspace_metadata(&mut target)?;
+    }
+
+    let mut workspace_root = target.workspace_root.clone();
+    let mut app_relative_path = None;
+    if let Some(root) = workspace_root.as_deref() {
+        let discovery = workspace::discover(root)?;
+        if let Some(discovery) = discovery {
+            workspace_package_manager = discovery.package_manager.clone();
+            if let Some(package) = find_workspace_package_for_target(&discovery, &target) {
+                workspace_root = Some(discovery.root.clone());
+                app_relative_path = Some(package.relative_path.clone());
+                package_scripts = package.scripts.clone();
+                target.workspace_root = Some(discovery.root.clone());
+                target.workspace_name = Some(discovery.workspace_name.clone());
+                target.app_slug = Some(package.slug.clone());
+                target.package_name = package.name.clone();
+            }
+        }
+    }
+
+    if app_relative_path.is_none() {
+        if let Some(root) = workspace_root.as_deref() {
+            app_relative_path = relative_path(root, &target.path);
+        }
+    }
+
+    let execution_cwd = if let Some(root) = workspace_root.as_ref() {
+        root.clone()
+    } else if selector.project.is_some() && options.profile_command {
+        target.path.clone()
+    } else {
+        cwd.to_path_buf()
+    };
+
+    Ok(WorkspaceExecutionPlan {
+        workspace_root,
+        app_path: target.path.clone(),
+        app_relative_path,
+        app_slug: target.app_slug.clone(),
+        package_name: target.package_name.clone(),
+        package_scripts,
+        project: target.name.clone(),
+        vault: target.vault.clone(),
+        execution_cwd,
+        workspace_package_manager,
+        target,
+    })
+}
+
+pub fn mount_command(plan: &WorkspaceExecutionPlan, argv: &[String]) -> Result<MountedCommand> {
+    mount_command_inner(plan, argv, true)
+}
+
+pub fn mount_profile_command(
+    plan: &WorkspaceExecutionPlan,
+    argv: &[String],
+) -> Result<MountedCommand> {
+    mount_command_inner(plan, argv, false)
+}
+
+fn mount_command_inner(
+    plan: &WorkspaceExecutionPlan,
+    argv: &[String],
+    reject_unsupported_raw: bool,
+) -> Result<MountedCommand> {
+    if argv.is_empty() {
+        anyhow::bail!("command args are required unless --profile is used");
+    }
+    if !plan.is_workspace_app() {
+        return Ok(MountedCommand {
+            argv: argv.to_vec(),
+            display: argv.join(" "),
+            mounted: false,
+        });
+    }
+    if command_is_workspace_qualified(argv) {
+        return Ok(MountedCommand {
+            argv: argv.to_vec(),
+            display: argv.join(" "),
+            mounted: false,
+        });
+    }
+
+    let manager = argv[0].as_str();
+    let mounted = match manager {
+        "pnpm" => mount_filter_command("pnpm", argv, plan, false)?,
+        "npm" => mount_npm_command(argv, plan)?,
+        "yarn" => mount_yarn_command(argv, plan)?,
+        "bun" => mount_filter_command("bun", argv, plan, true)?,
+        _ => None,
+    };
+
+    let Some(argv) = mounted else {
+        if !reject_unsupported_raw {
+            return Ok(MountedCommand {
+                argv: argv.to_vec(),
+                display: argv.join(" "),
+                mounted: false,
+            });
+        }
+        anyhow::bail!(
+            "raw app command cannot be safely mounted; use a profile or run with --app using a package-manager script"
+        );
+    };
+    Ok(MountedCommand {
+        display: argv.join(" "),
+        argv,
+        mounted: true,
+    })
 }
 
 pub fn resolve_one_with_passphrase(
@@ -261,13 +419,15 @@ fn attach_registry_metadata(target: &mut WorkspaceTarget) {
 }
 
 fn attach_workspace_metadata(target: &mut WorkspaceTarget) -> Result<()> {
-    if target.workspace_root.is_some() {
-        return Ok(());
-    }
-    let Some(discovery) = workspace::discover_containing(&target.path)? else {
+    let discovery = if let Some(root) = target.workspace_root.as_deref() {
+        workspace::discover(root)?
+    } else {
+        workspace::discover_containing(&target.path)?
+    };
+    let Some(discovery) = discovery else {
         return Ok(());
     };
-    if let Some(package) = find_workspace_package_for_project(&discovery, &target.name) {
+    if let Some(package) = find_workspace_package_for_target(&discovery, target) {
         target.workspace_root = Some(discovery.root.clone());
         target.workspace_name = Some(discovery.workspace_name.clone());
         target.app_slug = Some(package.slug.clone());
@@ -276,11 +436,271 @@ fn attach_workspace_metadata(target: &mut WorkspaceTarget) -> Result<()> {
     Ok(())
 }
 
+fn find_workspace_package_for_target<'a>(
+    discovery: &'a workspace::WorkspaceDiscovery,
+    target: &WorkspaceTarget,
+) -> Option<&'a workspace::WorkspacePackage> {
+    discovery.app_candidates().find(|package| {
+        package.project_name == target.name
+            || target
+                .app_slug
+                .as_deref()
+                .is_some_and(|app| package.matches(app))
+            || target
+                .package_name
+                .as_deref()
+                .is_some_and(|name| package.matches(name))
+            || same_path(&package.path, &target.path)
+            || config::read_project_config(&package.path)
+                .map(|cfg| cfg.project == target.name)
+                .unwrap_or(false)
+    })
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right || left.canonicalize().ok() == right.canonicalize().ok()
+}
+
+fn relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    path.strip_prefix(root)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let root = root.canonicalize().ok()?;
+            let path = path.canonicalize().ok()?;
+            path.strip_prefix(root).ok().map(Path::to_path_buf)
+        })
+}
+
+fn workspace_selector(plan: &WorkspaceExecutionPlan, allow_slug: bool) -> Option<String> {
+    plan.package_name
+        .clone()
+        .or_else(|| allow_slug.then(|| plan.app_slug.clone()).flatten())
+}
+
+fn app_relative_selector(plan: &WorkspaceExecutionPlan) -> Option<String> {
+    plan.app_relative_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn command_is_workspace_qualified(argv: &[String]) -> bool {
+    match argv.first().map(String::as_str) {
+        Some("pnpm" | "bun") => has_workspace_flag(&argv[1..], &["--filter", "-F"]),
+        Some("npm") => has_workspace_flag(&argv[1..], &["--workspace", "-w"]),
+        Some("yarn") => argv.get(1).is_some_and(|arg| arg == "workspace"),
+        _ => false,
+    }
+}
+
+fn has_workspace_flag(args: &[String], flags: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        flags.iter().any(|flag| {
+            arg == flag
+                || arg
+                    .strip_prefix(flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+    })
+}
+
+fn mount_filter_command(
+    binary: &str,
+    argv: &[String],
+    plan: &WorkspaceExecutionPlan,
+    force_run: bool,
+) -> Result<Option<Vec<String>>> {
+    if !is_package_script_command(argv, &plan.package_scripts) {
+        return Ok(None);
+    }
+    let Some(selector) = workspace_selector(plan, true) else {
+        anyhow::bail!("workspace app is missing package name or app slug");
+    };
+    let mut out = vec![binary.to_string(), "--filter".to_string(), selector];
+    if force_run && argv.get(1).map_or(true, |arg| arg != "run") {
+        out.push("run".to_string());
+    }
+    out.extend(argv[1..].iter().cloned());
+    Ok(Some(out))
+}
+
+fn mount_npm_command(
+    argv: &[String],
+    plan: &WorkspaceExecutionPlan,
+) -> Result<Option<Vec<String>>> {
+    if !is_package_script_command(argv, &plan.package_scripts) {
+        return Ok(None);
+    }
+    let Some(selector) = app_relative_selector(plan) else {
+        anyhow::bail!("workspace app is missing a relative path");
+    };
+    let mut out = vec!["npm".to_string(), "--workspace".to_string(), selector];
+    if argv.get(1).is_some_and(|arg| arg == "run") {
+        out.extend(argv[1..].iter().cloned());
+    } else {
+        out.push("run".to_string());
+        out.extend(argv[1..].iter().cloned());
+    }
+    Ok(Some(out))
+}
+
+fn mount_yarn_command(
+    argv: &[String],
+    plan: &WorkspaceExecutionPlan,
+) -> Result<Option<Vec<String>>> {
+    if !is_package_script_command(argv, &plan.package_scripts) {
+        return Ok(None);
+    }
+    let Some(selector) = workspace_selector(plan, true) else {
+        anyhow::bail!("workspace app is missing package name or app slug");
+    };
+    let mut out = vec!["yarn".to_string(), "workspace".to_string(), selector];
+    out.extend(argv[1..].iter().cloned());
+    Ok(Some(out))
+}
+
+fn is_package_script_command(argv: &[String], scripts: &[String]) -> bool {
+    let Some(script) = script_name(argv) else {
+        return false;
+    };
+    !script.starts_with('-') && scripts.iter().any(|known| known == script)
+}
+
+fn script_name(argv: &[String]) -> Option<&str> {
+    match argv.get(1).map(String::as_str) {
+        Some("run") => argv.get(2).map(String::as_str),
+        Some(script) => Some(script),
+        None => None,
+    }
+}
+
 fn refresh_vault_with_passphrase(target: &mut WorkspaceTarget, passphrase: &str) {
     if let Ok(config) = config::read_project_config(&target.path) {
         if config.project == target.name {
             target.vault =
                 config::resolve_vault_path_with_passphrase(&target.path, &config, passphrase);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan() -> WorkspaceExecutionPlan {
+        let target = WorkspaceTarget {
+            name: "workspace:web".to_string(),
+            path: PathBuf::from("/repo/apps/web"),
+            vault: PathBuf::from("/repo/apps/web/.env.vault"),
+            workspace_root: Some(PathBuf::from("/repo")),
+            workspace_name: Some("workspace".to_string()),
+            app_slug: Some("web".to_string()),
+            package_name: Some("@workspace/web".to_string()),
+        };
+        WorkspaceExecutionPlan {
+            workspace_root: Some(PathBuf::from("/repo")),
+            app_path: PathBuf::from("/repo/apps/web"),
+            app_relative_path: Some(PathBuf::from("apps/web")),
+            app_slug: Some("web".to_string()),
+            package_name: Some("@workspace/web".to_string()),
+            package_scripts: vec!["dev".to_string(), "payload".to_string()],
+            project: "workspace:web".to_string(),
+            vault: PathBuf::from("/repo/apps/web/.env.vault"),
+            execution_cwd: PathBuf::from("/repo"),
+            workspace_package_manager: Some("pnpm".to_string()),
+            target,
+        }
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn mounts_supported_package_manager_script_commands() {
+        let plan = plan();
+
+        assert_eq!(
+            mount_command(&plan, &args(&["pnpm", "dev"])).unwrap().argv,
+            args(&["pnpm", "--filter", "@workspace/web", "dev"])
+        );
+        assert_eq!(
+            mount_command(&plan, &args(&["npm", "run", "dev"]))
+                .unwrap()
+                .argv,
+            args(&["npm", "--workspace", "apps/web", "run", "dev"])
+        );
+        assert_eq!(
+            mount_command(&plan, &args(&["npm", "dev"])).unwrap().argv,
+            args(&["npm", "--workspace", "apps/web", "run", "dev"])
+        );
+        assert_eq!(
+            mount_command(&plan, &args(&["yarn", "dev"])).unwrap().argv,
+            args(&["yarn", "workspace", "@workspace/web", "dev"])
+        );
+        assert_eq!(
+            mount_command(&plan, &args(&["bun", "run", "dev"]))
+                .unwrap()
+                .argv,
+            args(&["bun", "--filter", "@workspace/web", "run", "dev"])
+        );
+        assert_eq!(
+            mount_command(&plan, &args(&["bun", "dev"])).unwrap().argv,
+            args(&["bun", "--filter", "@workspace/web", "run", "dev"])
+        );
+        assert_eq!(
+            mount_command(&plan, &args(&["pnpm", "payload", "migrate"]))
+                .unwrap()
+                .argv,
+            args(&["pnpm", "--filter", "@workspace/web", "payload", "migrate"])
+        );
+    }
+
+    #[test]
+    fn leaves_already_workspace_qualified_commands_unchanged() {
+        let plan = plan();
+        for command in [
+            args(&["pnpm", "--filter", "@workspace/web", "dev"]),
+            args(&["pnpm", "-F", "@workspace/web", "dev"]),
+            args(&["npm", "--workspace", "apps/web", "run", "dev"]),
+            args(&["npm", "-w", "apps/web", "run", "dev"]),
+            args(&["yarn", "workspace", "@workspace/web", "dev"]),
+            args(&["bun", "--filter", "@workspace/web", "run", "dev"]),
+        ] {
+            let mounted = mount_command(&plan, &command).unwrap();
+            assert_eq!(mounted.argv, command);
+            assert!(!mounted.mounted);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_raw_app_commands() {
+        let plan = plan();
+
+        let err = mount_command(&plan, &args(&["node", "server.js"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("raw app command cannot be safely mounted"));
+
+        let install = mount_command(&plan, &args(&["pnpm", "install"]))
+            .unwrap_err()
+            .to_string();
+        assert!(install.contains("raw app command cannot be safely mounted"));
+
+        let profile_command = mount_profile_command(&plan, &args(&["node", "server.js"])).unwrap();
+        assert_eq!(profile_command.argv, args(&["node", "server.js"]));
+        assert!(!profile_command.mounted);
+    }
+
+    #[test]
+    fn returns_plain_commands_for_non_workspace_projects() {
+        let mut plan = plan();
+        plan.workspace_root = None;
+        plan.app_relative_path = None;
+
+        let mounted = mount_command(&plan, &args(&["pnpm", "dev"])).unwrap();
+
+        assert_eq!(mounted.argv, args(&["pnpm", "dev"]));
+        assert!(!mounted.mounted);
     }
 }
