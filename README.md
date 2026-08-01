@@ -5,21 +5,19 @@ project envs encrypted in `.env.vault`, lets normal terminal workflows keep
 working, and gives AI agents scoped, auditable access to only the env names they
 were approved to use.
 
-Ward's current vault model is API-derived:
+Ward's current vault model is built around a simple recovery flow:
 
 - the encrypted `.env.vault` file is safe to store with the project;
-- the user's PIN/passphrase is never sent to Ward's key API;
-- Ward derives a local client factor, calls the key API, and combines both
-  parts locally into the AES-256-GCM vault key;
-- the key API returns temporary key material only;
-- encryption and decryption happen on the user's machine;
-- the API server secret is deployed as infrastructure secret
-  `WARD_KEY_API_SERVER_SECRETS`, not committed to Git.
+- the user's PIN/passphrase stays on the user's machine;
+- Ward contacts the Ward key service during unlock;
+- plaintext env values are never sent to Ward's servers;
+- unlocking happens locally on the user's machine;
+- no separate keypair file is required for reinstall or clone recovery.
 
 The recovery rule is:
 
 ```text
-Ward installed + .env.vault + correct PIN/passphrase + reachable Ward key API
+Ward installed + .env.vault + correct PIN/passphrase + reachable Ward key service
 = decryptable after reinstall
 ```
 
@@ -69,9 +67,9 @@ cd <repo>
 ward env unlock
 ```
 
-Enter the same PIN/passphrase. Ward reads the metadata inside `.env.vault`,
-calls the Ward key API, derives the decrypt key locally, and writes a plaintext
-`.env` for manual local development.
+Enter the same PIN/passphrase. Ward uses the vault metadata and Ward key
+service to unlock locally, then writes a plaintext `.env` for manual local
+development.
 
 When you are done editing plaintext envs:
 
@@ -82,32 +80,17 @@ ward env lock
 For command execution, prefer `ward run`, `ward dev`, or human mode instead of
 leaving plaintext `.env` files around.
 
-## Key API Infrastructure
+## Ward Key Service
 
-Ward uses this API endpoint by default:
+For normal use, there is nothing to configure. Ward automatically uses the Ward
+key service when unlocking a vault. Keep the `.env.vault` file with the project
+and remember the PIN/passphrase.
 
-```text
-https://api.aiward.dev/v1/vault-key/derive
-```
+If the Ward key service is temporarily unavailable, vault unlock can be retried
+when service is restored. If you need a recovery option that does not depend on
+service availability, export an offline recovery key.
 
-Override it for local testing or failover:
-
-```bash
-export WARD_KEY_API_URL="https://your-api.example.com/v1/vault-key/derive"
-```
-
-The API deployment must provide:
-
-```text
-WARD_KEY_API_SERVER_SECRETS="ward-api-derived-v1=<base64-secret>"
-```
-
-`ward-api-derived-v1` is a public server key identifier. The value after `=` is
-the private server secret. Store it as deployment secret/env state and keep an
-offline backup outside Git. If this secret is lost, vaults that depend on that
-server key cannot use the normal API-derived unlock path.
-
-Use an offline key export when API availability is a concern:
+Use an offline key export when Ward key service availability is a concern:
 
 ```bash
 ward key export --output ward-recovery-key.json
@@ -368,7 +351,7 @@ They never record plaintext secret values.
 ward doctor
 ```
 
-Doctor checks vault state, API-derived key metadata, global off/on state,
+Doctor checks vault state, unlock/recovery metadata, global off/on state,
 registry/config backups, broker status, gitignore, grants, recovery exports,
 and log integrity.
 
@@ -379,12 +362,11 @@ agent access, prompt-injection attempts, and casual local leaks.
 
 Within that boundary:
 
-- `.env.vault` stores ciphertext and public derivation metadata, not plaintext
-  secrets;
+- `.env.vault` stores encrypted env data, not plaintext secrets;
 - Ward does not store the PIN/passphrase;
-- Ward does not store the derived AES vault key;
-- the key API returns temporary key material only;
-- encryption and decryption happen locally;
+- Ward does not store reusable unlock keys;
+- Ward's servers do not receive plaintext env values;
+- vault unlock happens locally;
 - profile and command access is scoped by env name;
 - agent requests must include identity, command/profile, branch, commit,
   remote, and worktree context;
@@ -398,11 +380,6 @@ or a malicious process can fully control your user account, it can observe what
 you can observe. Ward's value is controlling normal development workflows,
 making agent access explicit, and keeping encrypted envs recoverable across
 machines.
-
-## Future Direction
-
-Future storage work is tracked in `FUTURE_FEATURES.md`. The current product
-flow remains API-derived `.env.vault` storage plus PIN/passphrase unlock.
 
 ## License
 
