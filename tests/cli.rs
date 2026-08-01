@@ -506,7 +506,7 @@ fn off_restores_multiple_projects_with_per_project_pin_sequence_and_retry() {
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env_remove("WARD_UNSAFE_TEST_PASSPHRASE")
         .env("WARD_UNSAFE_TEST_PASSPHRASE_SEQUENCE", "wrong,1234,9876")
-        .args(["off", "--json"])
+        .args(["off", "--each", "--json"])
         .assert()
         .success()
         .stdout(

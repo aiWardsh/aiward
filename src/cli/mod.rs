@@ -396,6 +396,9 @@ pub enum Commands {
         /// Add Ward projects discovered under this root before restoring env files.
         #[arg(long)]
         discover: Option<PathBuf>,
+        /// Prompt separately for each project instead of reusing one PIN/passphrase for all projects.
+        #[arg(long)]
+        each: bool,
         /// Print machine-readable disable summary.
         #[arg(long)]
         json: bool,
@@ -1123,7 +1126,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             workspace,
             all,
         } => lock(project, app, workspace, all),
-        Commands::Off { discover, json } => ward_off(discover, json),
+        Commands::Off {
+            discover,
+            each,
+            json,
+        } => ward_off(discover, each, json),
         Commands::On { json } => ward_on(json),
         Commands::Teardown {
             project,
@@ -2382,14 +2389,21 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
         ProjectsCommand::Discover { path, json } => projects_discover(path, json)?,
         ProjectsCommand::Use { project } => use_project(&project)?,
         ProjectsCommand::Remove { project } => {
-            if registry::remove_project(&project)? {
+            let registry_removed = registry::remove_project(&project)?;
+            let backup_removed = config::remove_project_config_backup(&project)?;
+            if registry_removed || backup_removed {
                 term::emit_header(&term::Header {
                     command: Some("projects remove"),
                     project: &project,
                     path: None,
                     mode: None,
                 });
-                term::ok("project removed");
+                if registry_removed {
+                    term::ok("registry entry removed");
+                }
+                if backup_removed {
+                    term::ok("config backup removed");
+                }
             } else {
                 term::warn_detail("project not found", &project);
             }
@@ -5968,7 +5982,7 @@ fn lock(
     Ok(())
 }
 
-fn ward_off(discover: Option<PathBuf>, json: bool) -> Result<()> {
+fn ward_off(discover: Option<PathBuf>, each: bool, json: bool) -> Result<()> {
     if crate::human::is_human_terminal() {
         let _ = crate::human::send_guardian_shutdown();
     }
@@ -5987,13 +6001,29 @@ fn ward_off(discover: Option<PathBuf>, json: bool) -> Result<()> {
 
     let mut projects = Vec::new();
     let total = targets.len();
-    for (index, target) in targets.into_iter().enumerate() {
-        projects.push(restore_ward_off_target_with_retries(
-            &target,
-            &timestamp,
-            index + 1,
-            total,
-        ));
+    if each {
+        for (index, target) in targets.into_iter().enumerate() {
+            projects.push(restore_ward_off_target_with_retries(
+                &target,
+                &timestamp,
+                index + 1,
+                total,
+            ));
+        }
+    } else {
+        let passphrase = if targets.iter().any(|target| target.path.is_dir()) {
+            Some(vault::read_existing_passphrase()?)
+        } else {
+            None
+        };
+        for target in targets {
+            projects.push(restore_ward_off_target(
+                &target,
+                passphrase.as_deref().unwrap_or(""),
+                &timestamp,
+                usize::from(passphrase.is_some()),
+            ));
+        }
     }
 
     let restored = projects
@@ -11343,6 +11373,31 @@ mod tests {
         std::env::remove_var("WARD_HOME");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn projects_remove_deletes_backup_only_tracking() {
+        let _guard = cwd_lock();
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+
+        let config =
+            ProjectConfig::default_for_dir(project.path(), Some("stale-demo".to_string())).unwrap();
+        config::write_project_config(project.path(), &config, false).unwrap();
+        assert!(config::config_backup_path("stale-demo").exists());
+        assert_eq!(collect_ward_off_targets().unwrap().len(), 1);
+
+        projects_command(ProjectsCommand::Remove {
+            project: "stale-demo".to_string(),
+        })
+        .unwrap();
+
+        assert!(!config::config_backup_path("stale-demo").exists());
+        assert!(collect_ward_off_targets().unwrap().is_empty());
+
+        std::env::remove_var("WARD_HOME");
+    }
+
     #[cfg(unix)]
     #[test]
     fn ward_off_restore_reports_symlinked_relative_vault_without_panicking() {
@@ -12399,6 +12454,7 @@ mod tests {
                 "{:?}",
                 Commands::Off {
                     discover: Some(".".into()),
+                    each: true,
                     json: true,
                 }
             ),

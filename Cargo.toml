@@ -1,6 +1,6 @@
 [package]
 name = "aiward"
-version = "0.5.32"
+version = "0.5.33"
 edition = "2021"
 rust-version = "1.86"
 description = "Local-first AI secret firewall for development environments."

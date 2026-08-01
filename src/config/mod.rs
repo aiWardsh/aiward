@@ -215,6 +215,15 @@ pub fn read_project_config_backup(project: &str) -> Result<ProjectConfigBackup> 
     serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+pub fn remove_project_config_backup(project: &str) -> Result<bool> {
+    let path = config_backup_path(project);
+    if !path.exists() {
+        return Ok(false);
+    }
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    Ok(true)
+}
+
 pub fn find_project_config_backup_for_path(
     cwd: &Path,
 ) -> Result<Option<(PathBuf, ProjectConfigBackup)>> {

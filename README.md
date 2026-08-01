@@ -172,6 +172,7 @@ across your machine:
 
 ```bash
 ward off
+ward off --each
 ward off --discover ~/Documents
 ```
 
@@ -179,8 +180,9 @@ Ward writes `~/.ward/disabled.json`, stops the local runtime, clears unlock
 sessions and session grants, then restores plaintext `.env` files for every
 known project it can decrypt. Known projects come from `~/.ward/registry.json`
 and `~/.ward/config-backups/`; `--discover` adds projects found under the given
-root to the registry first. Ward prompts project by project, so projects may use
-different PINs/passphrases. If one project cannot be decrypted after retries,
+root to the registry first. By default Ward prompts once and tries that
+PIN/passphrase for every project. Use `--each` to prompt project by project when
+projects use different PINs/passphrases. If one project cannot be decrypted,
 Ward reports that failure and continues with the others.
 
 Ward never deletes `.ward.json`, `.env.vault`, registry entries, grants, logs,
