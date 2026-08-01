@@ -213,7 +213,10 @@ pub fn record_from_plaintext(
     let updated_at = chrono::Utc::now().to_rfc3339();
     let data_key = random_data_key();
     let payload = vault::encrypt_env(plaintext, &data_key)?;
-    let key_wrap = vault::encrypt_env(&data_key, passphrase)?;
+    let key_mode = vault::read_vault(vault_path)
+        .map(|envelope| envelope.key_mode)
+        .unwrap_or(vault::VaultKeyMode::LocalDerivedV1);
+    let key_wrap = vault::encrypt_env_with_key_mode(&data_key, passphrase, key_mode)?;
 
     Ok(ProjectStoreRecord {
         version: STORE_RECORD_VERSION,

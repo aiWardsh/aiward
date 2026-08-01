@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::{read_project_config, resolve_vault_path, resolve_vault_path_with_passphrase},
@@ -31,6 +32,12 @@ pub struct RegisteredProject {
     pub git_remote: Option<String>,
     pub created_at: String,
     pub last_used: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
     #[serde(default)]
     pub allowed_worktree_roots: Vec<PathBuf>,
     #[serde(default)]
@@ -56,6 +63,25 @@ pub struct ResolvedProject {
     pub name: String,
     pub path: PathBuf,
     pub vault: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredProject {
+    pub display_name: String,
+    pub path: PathBuf,
+    pub vault: PathBuf,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveryRegistration {
+    pub project: String,
+    pub display_name: String,
+    pub path: PathBuf,
+    pub vault: PathBuf,
+    pub source: String,
+    pub already_registered: bool,
 }
 
 pub fn registry_path() -> PathBuf {
@@ -99,6 +125,9 @@ pub fn register_project(
         git_remote: git.remote,
         created_at: chrono::Utc::now().to_rfc3339(),
         last_used: Some(chrono::Utc::now().to_rfc3339()),
+        display_name: Some(project.clone()),
+        source: Some("manual".to_string()),
+        last_seen_at: Some(chrono::Utc::now().to_rfc3339()),
         allowed_worktree_roots: Vec::new(),
         known_worktrees: Vec::new(),
         auto_bind_worktrees: true,
@@ -130,6 +159,7 @@ pub fn update_project_vault(project: &str, path: PathBuf, vault: PathBuf) -> Res
             registered.vault = vault;
             registered.git_remote = git.remote;
             registered.last_used = Some(chrono::Utc::now().to_rfc3339());
+            registered.last_seen_at = Some(chrono::Utc::now().to_rfc3339());
             registered.canonical_repo_path = canonical_repo_path;
             registered.git_common_dir = git.common_dir;
         }
@@ -140,6 +170,9 @@ pub fn update_project_vault(project: &str, path: PathBuf, vault: PathBuf) -> Res
                 git_remote: git.remote,
                 created_at: chrono::Utc::now().to_rfc3339(),
                 last_used: Some(chrono::Utc::now().to_rfc3339()),
+                display_name: Some(project.to_string()),
+                source: Some("manual".to_string()),
+                last_seen_at: Some(chrono::Utc::now().to_rfc3339()),
                 allowed_worktree_roots: Vec::new(),
                 known_worktrees: Vec::new(),
                 auto_bind_worktrees: true,
@@ -155,6 +188,182 @@ pub fn update_project_vault(project: &str, path: PathBuf, vault: PathBuf) -> Res
     }
     registry.active_project = Some(project.to_string());
     save_registry(&registry)
+}
+
+pub fn refresh_project_vault(project: &str, path: PathBuf, vault: PathBuf) -> Result<()> {
+    let mut registry = load_registry()?;
+    let vault = validate_vault_path(&path, &vault)?;
+    if let Some(registered) = registry.projects.get_mut(project) {
+        registered.path = path;
+        registered.vault = vault;
+        registered.last_seen_at = Some(chrono::Utc::now().to_rfc3339());
+        save_registry(&registry)?;
+    }
+    Ok(())
+}
+
+pub fn upsert_discovered_projects(
+    candidates: Vec<DiscoveredProject>,
+) -> Result<Vec<DiscoveryRegistration>> {
+    let mut registry = load_registry()?;
+    let mut results = Vec::new();
+    for candidate in candidates {
+        let original_path = candidate.path.clone();
+        let raw_vault = candidate.vault.clone();
+        let path = original_path
+            .canonicalize()
+            .unwrap_or_else(|_| original_path.clone());
+        let vault_candidate = normalize_candidate_vault_path(&original_path, &path, &raw_vault);
+        let Ok(vault) = validate_vault_path(&path, &vault_candidate) else {
+            continue;
+        };
+        let display_name = normalized_display_name(&candidate.display_name, &path);
+        let source = candidate.source;
+        let now = chrono::Utc::now().to_rfc3339();
+        let git = collect_git_context(&path);
+        let canonical_repo_path = path.canonicalize().ok();
+
+        let existing_key = registry
+            .projects
+            .iter()
+            .find(|(_, registered)| same_path(&registered.path, &path))
+            .map(|(key, _)| key.clone());
+        let (project, already_registered) = match existing_key {
+            Some(project) => (project, true),
+            None => (
+                discovered_project_key(&registry, &display_name, &path),
+                false,
+            ),
+        };
+
+        if let Some(registered) = registry.projects.get_mut(&project) {
+            registered.path = path.clone();
+            registered.vault = vault.clone();
+            registered.git_remote = git.remote;
+            registered.last_seen_at = Some(now.clone());
+            if registered.display_name.is_none() {
+                registered.display_name = Some(display_name.clone());
+            }
+            if registered.source.is_none() {
+                registered.source = Some(source.clone());
+            }
+            registered.canonical_repo_path = canonical_repo_path;
+            registered.git_common_dir = git.common_dir;
+        } else {
+            registry.projects.insert(
+                project.clone(),
+                RegisteredProject {
+                    path: path.clone(),
+                    vault: vault.clone(),
+                    git_remote: git.remote,
+                    created_at: now.clone(),
+                    last_used: None,
+                    display_name: Some(display_name.clone()),
+                    source: Some(source.clone()),
+                    last_seen_at: Some(now),
+                    allowed_worktree_roots: Vec::new(),
+                    known_worktrees: Vec::new(),
+                    auto_bind_worktrees: true,
+                    canonical_repo_path,
+                    git_common_dir: git.common_dir,
+                    workspace_root: None,
+                    workspace_name: None,
+                    app_slug: None,
+                    parent_workspace: None,
+                },
+            );
+        }
+        results.push(DiscoveryRegistration {
+            project,
+            display_name,
+            path,
+            vault,
+            source,
+            already_registered,
+        });
+    }
+    if !results.is_empty() {
+        save_registry(&registry)?;
+    }
+    Ok(results)
+}
+
+fn normalized_display_name(display_name: &str, path: &Path) -> String {
+    let trimmed = display_name.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("project")
+        .to_string()
+}
+
+fn normalize_candidate_vault_path(
+    original_path: &Path,
+    canonical_path: &Path,
+    vault: &Path,
+) -> PathBuf {
+    if vault.is_absolute() {
+        if let Ok(relative) = vault.strip_prefix(original_path) {
+            return canonical_path.join(relative);
+        }
+    }
+    vault.to_path_buf()
+}
+
+fn discovered_project_key(registry: &Registry, display_name: &str, path: &Path) -> String {
+    if !registry.projects.contains_key(display_name) {
+        return display_name.to_string();
+    }
+    let slug = slugify(display_name);
+    let hash = path_hash8(path);
+    let base = format!("{slug}-{hash}");
+    if !registry.projects.contains_key(&base) {
+        return base;
+    }
+    for index in 2.. {
+        let candidate = format!("{base}-{index}");
+        if !registry.projects.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("open-ended suffix search should find a registry key")
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
+}
+
+fn path_hash8(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    hex::encode(&hash[..4])
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
 }
 
 pub fn update_project_workspace_metadata(
@@ -352,6 +561,9 @@ mod tests {
             parent_workspace: None,
             created_at: "2026-05-26T00:00:00Z".to_string(),
             last_used: None,
+            display_name: None,
+            source: None,
+            last_seen_at: None,
         }
     }
 
@@ -444,6 +656,54 @@ mod tests {
         assert_eq!(resolved.vault, vault);
         assert!(set_active_project("missing").is_err());
         assert!(resolve_project(Some("missing"), project.path()).is_err());
+
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn discovered_projects_dedupe_by_path_and_suffix_duplicate_names() {
+        let _guard = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        set_home(home.path());
+
+        let first = upsert_discovered_projects(vec![DiscoveredProject {
+            display_name: "demo".to_string(),
+            path: project_a.path().to_path_buf(),
+            vault: project_a.path().join(".env.vault"),
+            source: "config".to_string(),
+        }])
+        .unwrap();
+        let second = upsert_discovered_projects(vec![
+            DiscoveredProject {
+                display_name: "demo".to_string(),
+                path: project_a.path().to_path_buf(),
+                vault: project_a.path().join(".env.vault"),
+                source: "config".to_string(),
+            },
+            DiscoveredProject {
+                display_name: "demo".to_string(),
+                path: project_b.path().to_path_buf(),
+                vault: project_b.path().join(".env.vault"),
+                source: "vault".to_string(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(first[0].project, "demo");
+        assert!(second
+            .iter()
+            .any(|project| project.project == "demo" && project.display_name == "demo"));
+        assert!(second.iter().any(|project| {
+            project.project.starts_with("demo-")
+                && project.project != "demo"
+                && project.display_name == "demo"
+                && !project.already_registered
+        }));
+        let registry = load_registry().unwrap();
+        assert_eq!(registry.projects.len(), 2);
 
         std::env::remove_var("WARD_HOME");
     }

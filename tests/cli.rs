@@ -11,7 +11,7 @@ use std::{
 };
 use ward::{
     approvals::ApprovalScope,
-    cli::{dispatch, Cli, Commands, EnvCommand, LogsCommand, ProjectsCommand},
+    cli::{dispatch, Cli, Commands, EnvCommand, KeyModeArg, LogsCommand, ProjectsCommand},
     config,
     logs::LogKind,
 };
@@ -90,9 +90,7 @@ impl TestProject {
             .stderr(
                 predicate::str::contains("vault encrypted")
                     .and(predicate::str::contains("session unlocked"))
-                    .and(predicate::str::contains(
-                        "vault recoverable with .env.vault + PIN/passphrase",
-                    )),
+                    .and(predicate::str::contains("vault recoverable")),
             );
     }
 
@@ -292,6 +290,13 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
 
     assert!(fixture.project_dir.path().join(".ward.json").exists());
     assert!(fixture.project_dir.path().join(".env.vault").exists());
+    let vault: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.project_dir.path().join(".env.vault")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(vault["version"], 2);
+    assert_eq!(vault["keyMode"], "api-derived-v1");
+    assert!(vault["api"]["keyDerivationNonce"].as_str().is_some());
     let locked_env = std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
     assert!(locked_env.contains("Ward managed locked .env"));
     assert!(!locked_env.contains("postgres://secret"));
@@ -327,10 +332,10 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
     assert!(gitignore.contains("!.env.vault\n"));
 
     let agents = std::fs::read_to_string(fixture.project_dir.path().join("AGENTS.md")).unwrap();
-    assert!(agents.contains("ward request --profile dev"));
+    assert!(agents.contains("ward request --app <app-name> --profile dev"));
     assert!(agents.contains("ward dev"));
     assert!(agents.contains("confirmationRequired"));
-    assert!(agents.contains("--confirm-critical"));
+    assert!(agents.contains("ward approvals wait <request-id> --json"));
     assert!(agents.contains("native structured choice UI"));
     assert!(agents.contains("`action.*` findings"));
 
@@ -373,6 +378,39 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("already an Ward locked marker"));
+}
+
+#[test]
+fn api_derived_vault_unlocks_after_clone_with_fresh_ward_home() {
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+
+    let clone = tempfile::tempdir().unwrap();
+    let fresh_home = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        fixture.project_dir.path().join(".ward.json"),
+        clone.path().join(".ward.json"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixture.project_dir.path().join(".env.vault"),
+        clone.path().join(".env.vault"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(clone.path())
+        .env("WARD_HOME", fresh_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["env", "unlock"])
+        .assert()
+        .success();
+
+    let env = std::fs::read_to_string(clone.path().join(".env")).unwrap();
+    assert!(env.contains("DATABASE_URL=postgres://secret"));
+    assert!(env.contains("PAYLOAD_SECRET=payload-secret"));
 }
 
 #[test]
@@ -450,6 +488,112 @@ fn off_restores_multiple_registered_projects_and_continues_after_wrong_pin_failu
     let restored = std::fs::read_to_string(project_a.path().join(".env")).unwrap();
     assert!(restored.contains("DATABASE_URL=postgres://alpha"));
     assert!(ward::env_file::is_locked_env_file(&project_b.path().join(".env")).unwrap());
+}
+
+#[test]
+fn off_restores_multiple_projects_with_per_project_pin_sequence_and_retry() {
+    let ward_home = tempfile::tempdir().unwrap();
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+
+    setup_project_with_home(project_a.path(), ward_home.path(), "alpha", "1234");
+    setup_project_with_home(project_b.path(), ward_home.path(), "bravo", "9876");
+
+    let output = Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(project_a.path())
+        .env("WARD_HOME", ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env_remove("WARD_UNSAFE_TEST_PASSPHRASE")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE_SEQUENCE", "wrong,1234,9876")
+        .args(["off", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"disabled\": true")
+                .and(predicate::str::contains("\"restored\": 2"))
+                .and(predicate::str::contains("\"failed\": 0")),
+        )
+        .get_output()
+        .stdout
+        .clone();
+    let summary: Value = serde_json::from_slice(&output).unwrap();
+    let projects = summary["projects"].as_array().unwrap();
+    assert!(projects.iter().any(|project| {
+        project["project"] == "alpha"
+            && project["displayName"] == "alpha"
+            && project["pinAttempts"] == 2
+    }));
+    assert!(projects.iter().any(|project| {
+        project["project"] == "bravo"
+            && project["displayName"] == "bravo"
+            && project["pinAttempts"] == 1
+    }));
+
+    let restored_a = std::fs::read_to_string(project_a.path().join(".env")).unwrap();
+    let restored_b = std::fs::read_to_string(project_b.path().join(".env")).unwrap();
+    assert!(restored_a.contains("DATABASE_URL=postgres://alpha"));
+    assert!(restored_b.contains("DATABASE_URL=postgres://bravo"));
+}
+
+#[test]
+fn projects_discover_registers_config_and_vault_only_projects() {
+    let ward_home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let config_project = root.path().join("apps/web");
+    let vault_only_project = root.path().join("tools/api");
+    std::fs::create_dir_all(&config_project).unwrap();
+    std::fs::create_dir_all(&vault_only_project).unwrap();
+    let config =
+        config::ProjectConfig::default_for_dir(&config_project, Some("web".to_string())).unwrap();
+    config::write_project_config(&config_project, &config, false).unwrap();
+    std::fs::write(vault_only_project.join(".env.vault"), "placeholder").unwrap();
+
+    let output = Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .args([
+            "projects",
+            "discover",
+            root.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"registered\": 2")
+                .and(predicate::str::contains("\"displayName\": \"web\""))
+                .and(predicate::str::contains("\"displayName\": \"api\"")),
+        )
+        .get_output()
+        .stdout
+        .clone();
+    let summary: Value = serde_json::from_slice(&output).unwrap();
+    let projects = summary["projects"].as_array().unwrap();
+    assert!(projects
+        .iter()
+        .any(|project| project["project"] == "web" && project["source"] == "config"));
+    assert!(projects
+        .iter()
+        .any(|project| project["project"] == "api" && project["source"] == "vault"));
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .args(["projects", "list"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("web")
+                .and(predicate::str::contains("name=web"))
+                .and(predicate::str::contains("source=config"))
+                .and(predicate::str::contains("api"))
+                .and(predicate::str::contains("source=vault")),
+        );
 }
 
 #[test]
@@ -3233,25 +3377,25 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["projects", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("demo"));
+        .stderr(predicate::str::contains("demo"));
     fixture
         .command()
         .args(["projects", "show", "demo"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Project: demo"));
+        .stderr(predicate::str::contains("projects show · demo"));
     fixture
         .command()
         .args(["projects", "remove", "demo"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Removed project demo"));
+        .stderr(predicate::str::contains("project removed"));
     fixture
         .command()
         .args(["projects", "remove", "demo"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Project not found"));
+        .stderr(predicate::str::contains("project not found"));
     fixture
         .command()
         .args(["projects", "register", "demo", "--vault", ".env.vault"])
@@ -3272,7 +3416,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["projects", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("  demo-alt"));
+        .stderr(predicate::str::contains("demo-alt"));
 
     fixture
         .command()
@@ -3287,7 +3431,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["env", "set", "OPENAI_API_KEY=sk test"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Set encrypted env OPENAI_API_KEY"));
+        .stderr(predicate::str::contains("encrypted env set"));
     let locked = std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
     assert!(locked.contains("Ward managed locked .env"));
     assert!(!locked.contains("sk test"));
@@ -3297,18 +3441,14 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["env", "unset", "OPENAI_API_KEY"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Removed encrypted env OPENAI_API_KEY",
-        ));
+        .stderr(predicate::str::contains("encrypted env removed"));
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unset", "OPENAI_API_KEY"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Encrypted env not found: OPENAI_API_KEY",
-        ));
+        .stderr(predicate::str::contains("encrypted env not found"));
 
     fixture
         .command()
@@ -3316,7 +3456,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["env", "unlock"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Wrote plaintext env"));
+        .stderr(predicate::str::contains("plaintext env written"));
     assert!(
         std::fs::read_to_string(fixture.project_dir.path().join(".env"))
             .unwrap()
@@ -3328,7 +3468,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["env", "lock"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Re-encrypted vault"));
+        .stderr(predicate::str::contains("vault re-encrypted"));
     assert!(
         std::fs::read_to_string(fixture.project_dir.path().join(".env"))
             .unwrap()
@@ -3346,7 +3486,12 @@ fn managed_env_projects_logs_and_teardown_flow() {
             .unwrap()
             .contains("postgres://secret")
     );
-    let absolute_export = fixture.project_dir.path().join("absolute.env.export");
+    let absolute_export = fixture
+        .project_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("absolute.env.export");
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
@@ -3374,7 +3519,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["logs", "verify"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok] sessions"));
+        .stderr(predicate::str::contains("sessions"));
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
@@ -3387,7 +3532,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["logs", "export", "sessions", "--output", "sessions.log"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("deleted logs should be treated"));
+        .stderr(predicate::str::contains("high severity"));
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
@@ -3400,7 +3545,8 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .command()
         .args(["allow", "--profile", "dev", "--agent", "codex"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("interactive local terminal"));
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
@@ -3446,10 +3592,8 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["teardown", "--yes"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Removed Ward project demo"))
-        .stdout(predicate::str::contains(
-            "Encrypted audit logs were preserved",
-        ));
+        .stderr(predicate::str::contains("Ward project removed"))
+        .stderr(predicate::str::contains("audit logs preserved"));
     assert!(
         std::fs::read_to_string(fixture.project_dir.path().join(".env.export"))
             .unwrap()
@@ -4513,6 +4657,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             project: Some("kept".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: KeyModeArg::LocalDerived,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -4541,6 +4686,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: KeyModeArg::LocalDerived,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,

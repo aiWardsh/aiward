@@ -3,15 +3,19 @@ use std::{
     io::{Cursor, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
 };
 
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use anyhow::{anyhow, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::fs_util;
 
@@ -19,7 +23,16 @@ const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
+const KEY_DERIVATION_NONCE_LEN: usize = 32;
+const DEFAULT_KEY_API_URL: &str = "https://api.aiward.dev/v1/vault-key/derive";
+const DEFAULT_SERVER_KEY_ID: &str = "ward-api-derived-v1";
+const API_DERIVE_DOMAIN: &[u8] = b"ward-api-derived-v1";
+const API_HKDF_SALT: &[u8] = b"ward-api-derived-v1/hkdf";
+const API_HKDF_INFO: &[u8] = b"ward-vault-aes-256-gcm";
+const UNSAFE_TEST_KEY_API_SECRET: &[u8] = b"ward-unsafe-test-key-api-secret-v1";
 pub(crate) const MIN_PIN_PASSPHRASE_LEN: usize = 4;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PinStrength {
@@ -53,10 +66,48 @@ impl PinStrength {
 #[serde(rename_all = "camelCase")]
 pub struct VaultEnvelope {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "VaultKeyMode::is_local_derived_v1")]
+    pub key_mode: VaultKeyMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiDerivedEnvelope>,
     pub kdf: KdfEnvelope,
     pub cipher: CipherEnvelope,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VaultKeyMode {
+    LocalDerivedV1,
+    ApiDerivedV1,
+}
+
+impl Default for VaultKeyMode {
+    fn default() -> Self {
+        Self::LocalDerivedV1
+    }
+}
+
+impl VaultKeyMode {
+    pub fn is_local_derived_v1(&self) -> bool {
+        matches!(self, Self::LocalDerivedV1)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LocalDerivedV1 => "local-derived-v1",
+            Self::ApiDerivedV1 => "api-derived-v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiDerivedEnvelope {
+    pub vault_id: String,
+    pub key_derivation_nonce: String,
+    pub server_key_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +149,16 @@ pub fn generate_vault_nonce() -> String {
     hex::encode(bytes)
 }
 
+pub fn generate_key_derivation_nonce() -> String {
+    let mut bytes = [0u8; KEY_DERIVATION_NONCE_LEN];
+    OsRng.fill_bytes(&mut bytes);
+    STANDARD.encode(bytes)
+}
+
+pub fn generate_vault_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Encrypts with custom Argon2 parameters (used for recovery blobs).
 pub fn encrypt_env_with_params(
     plaintext: &str,
@@ -129,6 +190,8 @@ pub fn encrypt_env_with_params(
 
     Ok(VaultEnvelope {
         version: 1,
+        key_mode: VaultKeyMode::LocalDerivedV1,
+        api: None,
         kdf,
         cipher: CipherEnvelope {
             name: "aes-256-gcm".to_string(),
@@ -169,6 +232,8 @@ pub fn encrypt_raw_bytes(plaintext: &[u8], key: &[u8; KEY_LEN]) -> Result<VaultE
 
     Ok(VaultEnvelope {
         version: 1,
+        key_mode: VaultKeyMode::LocalDerivedV1,
+        api: None,
         kdf,
         cipher: CipherEnvelope {
             name: "aes-256-gcm".to_string(),
@@ -182,15 +247,39 @@ pub fn encrypt_raw_bytes(plaintext: &[u8], key: &[u8; KEY_LEN]) -> Result<VaultE
 }
 
 pub fn import_env_file(source: &Path, vault_path: &Path, passphrase: &str) -> Result<PathBuf> {
+    import_env_file_with_key_mode(source, vault_path, passphrase, VaultKeyMode::LocalDerivedV1)
+}
+
+pub fn import_env_file_with_key_mode(
+    source: &Path,
+    vault_path: &Path,
+    passphrase: &str,
+    key_mode: VaultKeyMode,
+) -> Result<PathBuf> {
     let plaintext = fs_util::read_file_to_string(source, "dotenv source")?;
     validate_dotenv(&plaintext)?;
 
-    let envelope = encrypt_env(&plaintext, passphrase)?;
+    let envelope = encrypt_env_with_key_mode(&plaintext, passphrase, key_mode)?;
     write_vault(vault_path, &envelope)?;
     Ok(vault_path.to_path_buf())
 }
 
 pub fn encrypt_env(plaintext: &str, passphrase: &str) -> Result<VaultEnvelope> {
+    encrypt_env_with_key_mode(plaintext, passphrase, VaultKeyMode::LocalDerivedV1)
+}
+
+pub fn encrypt_env_with_key_mode(
+    plaintext: &str,
+    passphrase: &str,
+    key_mode: VaultKeyMode,
+) -> Result<VaultEnvelope> {
+    match key_mode {
+        VaultKeyMode::LocalDerivedV1 => encrypt_env_local(plaintext, passphrase),
+        VaultKeyMode::ApiDerivedV1 => encrypt_env_api_derived(plaintext, passphrase),
+    }
+}
+
+fn encrypt_env_local(plaintext: &str, passphrase: &str) -> Result<VaultEnvelope> {
     let mut salt = [0_u8; SALT_LEN];
     let mut iv = [0_u8; NONCE_LEN];
     OsRng.fill_bytes(&mut salt);
@@ -215,6 +304,87 @@ pub fn encrypt_env(plaintext: &str, passphrase: &str) -> Result<VaultEnvelope> {
 
     Ok(VaultEnvelope {
         version: 1,
+        key_mode: VaultKeyMode::LocalDerivedV1,
+        api: None,
+        kdf,
+        cipher: CipherEnvelope {
+            name: "aes-256-gcm".to_string(),
+            iv: STANDARD.encode(iv),
+            auth_tag: STANDARD.encode(auth_tag),
+            ciphertext: STANDARD.encode(encrypted),
+        },
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+pub fn encrypt_env_like(
+    existing: &VaultEnvelope,
+    plaintext: &str,
+    passphrase: &str,
+) -> Result<VaultEnvelope> {
+    match existing.key_mode {
+        VaultKeyMode::LocalDerivedV1 => {
+            let mut envelope = encrypt_env_local(plaintext, passphrase)?;
+            envelope.created_at = existing.created_at.clone();
+            Ok(envelope)
+        }
+        VaultKeyMode::ApiDerivedV1 => {
+            let mut envelope = encrypt_env_api_derived_with_metadata(
+                plaintext,
+                passphrase,
+                existing
+                    .api
+                    .clone()
+                    .context("api-derived vault is missing API metadata")?,
+            )?;
+            envelope.created_at = existing.created_at.clone();
+            Ok(envelope)
+        }
+    }
+}
+
+fn encrypt_env_api_derived(plaintext: &str, passphrase: &str) -> Result<VaultEnvelope> {
+    let api = ApiDerivedEnvelope {
+        vault_id: generate_vault_id(),
+        key_derivation_nonce: generate_key_derivation_nonce(),
+        server_key_id: DEFAULT_SERVER_KEY_ID.to_string(),
+    };
+    encrypt_env_api_derived_with_metadata(plaintext, passphrase, api)
+}
+
+fn encrypt_env_api_derived_with_metadata(
+    plaintext: &str,
+    passphrase: &str,
+    api: ApiDerivedEnvelope,
+) -> Result<VaultEnvelope> {
+    let mut salt = [0_u8; SALT_LEN];
+    let mut iv = [0_u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut iv);
+
+    let kdf = KdfEnvelope {
+        name: "argon2id".to_string(),
+        memory_cost: 65_536,
+        time_cost: 3,
+        parallelism: 1,
+        salt: STANDARD.encode(salt),
+    };
+
+    let mut key = derive_api_vault_key(passphrase, &salt, &kdf, &api)?;
+    let cipher = Aes256Gcm::new_from_slice(&key).expect("derived AES-256 key has valid length");
+    let mut encrypted = cipher
+        .encrypt(Nonce::from_slice(&iv), plaintext.as_bytes())
+        .expect("AES-GCM encryption should not fail for a valid nonce");
+    key.zeroize();
+
+    let auth_tag = encrypted.split_off(encrypted.len() - TAG_LEN);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    Ok(VaultEnvelope {
+        version: 2,
+        key_mode: VaultKeyMode::ApiDerivedV1,
+        api: Some(api),
         kdf,
         cipher: CipherEnvelope {
             name: "aes-256-gcm".to_string(),
@@ -253,8 +423,7 @@ pub fn edit_vault_file(vault_path: &Path, passphrase: &str) -> Result<()> {
         .context("failed to read edited temporary env buffer")?;
     validate_dotenv(&edited).context("edited env content is not valid dotenv syntax")?;
 
-    let mut updated = encrypt_env(&edited, passphrase)?;
-    updated.created_at = existing_envelope.created_at;
+    let updated = encrypt_env_like(&existing_envelope, &edited, passphrase)?;
     write_vault(vault_path, &updated)?;
     temp_file
         .close()
@@ -263,8 +432,14 @@ pub fn edit_vault_file(vault_path: &Path, passphrase: &str) -> Result<()> {
 }
 
 pub fn decrypt_env(envelope: &VaultEnvelope, passphrase: &str) -> Result<String> {
-    if envelope.version != 1 {
-        anyhow::bail!("unsupported vault version {}", envelope.version);
+    match envelope.key_mode {
+        VaultKeyMode::LocalDerivedV1 if envelope.version != 1 => {
+            anyhow::bail!("unsupported local vault version {}", envelope.version);
+        }
+        VaultKeyMode::ApiDerivedV1 if envelope.version != 2 => {
+            anyhow::bail!("unsupported api-derived vault version {}", envelope.version);
+        }
+        _ => {}
     }
     if envelope.kdf.name != "argon2id" {
         anyhow::bail!("unsupported KDF {}", envelope.kdf.name);
@@ -285,11 +460,21 @@ pub fn decrypt_env(envelope: &VaultEnvelope, passphrase: &str) -> Result<String>
     }
     ciphertext.extend(auth_tag);
 
-    let key = derive_key(passphrase, &salt, &envelope.kdf)?;
+    let mut key = match envelope.key_mode {
+        VaultKeyMode::LocalDerivedV1 => derive_key(passphrase, &salt, &envelope.kdf)?,
+        VaultKeyMode::ApiDerivedV1 => {
+            let api = envelope
+                .api
+                .as_ref()
+                .context("api-derived vault is missing API metadata")?;
+            derive_api_vault_key(passphrase, &salt, &envelope.kdf, api)?
+        }
+    };
     let cipher = Aes256Gcm::new_from_slice(&key).expect("derived AES-256 key has valid length");
     let plaintext = cipher
         .decrypt(Nonce::from_slice(&iv), ciphertext.as_ref())
         .map_err(|_| anyhow!("failed to decrypt vault; passphrase may be incorrect"))?;
+    key.zeroize();
 
     String::from_utf8(plaintext).context("vault plaintext is not valid UTF-8")
 }
@@ -375,11 +560,22 @@ pub fn read_new_pin(prompt: &str, confirm_prompt: &str) -> Result<String> {
 }
 
 pub fn read_existing_passphrase() -> Result<String> {
+    read_existing_passphrase_with_prompt("  Vault PIN/passphrase: ")
+}
+
+pub fn read_existing_passphrase_for_project(project: &str) -> Result<String> {
+    read_existing_passphrase_with_prompt(&format!("  Vault PIN/passphrase for {project}: "))
+}
+
+fn read_existing_passphrase_with_prompt(prompt: &str) -> Result<String> {
+    if let Some(passphrase) = test_passphrase_sequence_next() {
+        return Ok(passphrase);
+    }
     if let Some(passphrase) = test_passphrase() {
         return Ok(passphrase);
     }
 
-    prompt_existing_passphrase()
+    prompt_existing_passphrase(prompt)
 }
 
 pub fn validate_dotenv(contents: &str) -> Result<()> {
@@ -408,6 +604,42 @@ pub(crate) fn test_passphrase() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn test_passphrase_sequence_next() -> Option<String> {
+    let raw = std::env::var("WARD_UNSAFE_TEST_PASSPHRASE_SEQUENCE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let mut state = test_passphrase_sequence_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.raw.as_deref() != Some(raw.as_str()) {
+        state.raw = Some(raw.clone());
+        state.values = raw
+            .split(['\n', ','])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        state.index = 0;
+    }
+    let value = state.values.get(state.index).cloned();
+    if value.is_some() {
+        state.index += 1;
+    }
+    value
+}
+
+fn test_passphrase_sequence_state() -> &'static Mutex<TestPassphraseSequenceState> {
+    static STATE: OnceLock<Mutex<TestPassphraseSequenceState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(TestPassphraseSequenceState::default()))
+}
+
+#[derive(Default)]
+struct TestPassphraseSequenceState {
+    raw: Option<String>,
+    values: Vec<String>,
+    index: usize,
+}
+
 #[cfg(not(coverage))]
 fn prompt_new_passphrase_pair() -> Result<(String, String)> {
     let first = rpassword::prompt_password("  New vault PIN/passphrase: ")?;
@@ -425,12 +657,12 @@ fn prompt_new_passphrase_pair() -> Result<(String, String)> {
 }
 
 #[cfg(not(coverage))]
-fn prompt_existing_passphrase() -> Result<String> {
-    Ok(rpassword::prompt_password("  Vault PIN/passphrase: ")?)
+fn prompt_existing_passphrase(prompt: &str) -> Result<String> {
+    Ok(rpassword::prompt_password(prompt)?)
 }
 
 #[cfg(coverage)]
-fn prompt_existing_passphrase() -> Result<String> {
+fn prompt_existing_passphrase(_prompt: &str) -> Result<String> {
     Ok("coverage passphrase".to_string())
 }
 
@@ -485,6 +717,165 @@ fn derive_key(passphrase: &str, salt: &[u8], kdf: &KdfEnvelope) -> Result<[u8; K
     Ok(key)
 }
 
+fn derive_api_vault_key(
+    passphrase: &str,
+    salt: &[u8],
+    kdf: &KdfEnvelope,
+    api: &ApiDerivedEnvelope,
+) -> Result<[u8; KEY_LEN]> {
+    validate_api_metadata(api)?;
+    let mut client_factor = derive_key(passphrase, salt, kdf)?;
+    let server_material = derive_api_server_material(api, &client_factor, kdf)?;
+    let mut input = Vec::with_capacity(client_factor.len() + server_material.len());
+    input.extend_from_slice(&client_factor);
+    input.extend_from_slice(&server_material);
+    client_factor.zeroize();
+
+    let hk = Hkdf::<Sha256>::new(Some(API_HKDF_SALT), &input);
+    input.zeroize();
+    let mut key = [0_u8; KEY_LEN];
+    hk.expand(API_HKDF_INFO, &mut key)
+        .map_err(|_| anyhow!("failed to derive api-derived vault key"))?;
+    Ok(key)
+}
+
+fn validate_api_metadata(api: &ApiDerivedEnvelope) -> Result<()> {
+    anyhow::ensure!(
+        !api.vault_id.trim().is_empty(),
+        "api-derived vault is missing vaultId"
+    );
+    anyhow::ensure!(
+        !api.key_derivation_nonce.trim().is_empty(),
+        "api-derived vault is missing keyDerivationNonce"
+    );
+    anyhow::ensure!(
+        !api.server_key_id.trim().is_empty(),
+        "api-derived vault is missing serverKeyId"
+    );
+    Ok(())
+}
+
+fn derive_api_server_material(
+    api: &ApiDerivedEnvelope,
+    client_factor: &[u8; KEY_LEN],
+    kdf: &KdfEnvelope,
+) -> Result<Vec<u8>> {
+    if unsafe_test_key_api_enabled() {
+        return derive_unsafe_test_api_material(api, client_factor);
+    }
+
+    let request = ApiDeriveRequest {
+        version: 1,
+        vault_id: api.vault_id.clone(),
+        key_derivation_nonce: api.key_derivation_nonce.clone(),
+        server_key_id: api.server_key_id.clone(),
+        client_kdf: ApiClientKdf {
+            name: kdf.name.clone(),
+            memory_cost: kdf.memory_cost,
+            time_cost: kdf.time_cost,
+            parallelism: kdf.parallelism,
+        },
+        client_factor: STANDARD.encode(client_factor),
+    };
+    let endpoint = key_api_url();
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to initialize Ward key API client")?
+        .post(&endpoint)
+        .json(&request)
+        .send()
+        .with_context(|| format!("failed to call Ward key API at {endpoint}"))?;
+    if response.status().as_u16() == 429 {
+        anyhow::bail!("Ward key API rate limit exceeded; wait before trying this PIN again");
+    }
+    if !response.status().is_success() {
+        anyhow::bail!("Ward key API derive failed with HTTP {}", response.status());
+    }
+    let body: ApiDeriveResponse = response
+        .json()
+        .context("failed to parse Ward key API derive response")?;
+    anyhow::ensure!(
+        body.version == 1,
+        "unsupported Ward key API response version {}",
+        body.version
+    );
+    anyhow::ensure!(
+        body.server_key_id == api.server_key_id,
+        "Ward key API responded with server key id {}; expected {}",
+        body.server_key_id,
+        api.server_key_id
+    );
+    STANDARD
+        .decode(body.key_material)
+        .context("Ward key API returned invalid key material")
+}
+
+fn key_api_url() -> String {
+    env::var("WARD_KEY_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_KEY_API_URL.to_string())
+}
+
+fn unsafe_test_key_api_enabled() -> bool {
+    env::var("WARD_UNSAFE_TEST_KEY_API")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        || env::var("WARD_UNSAFE_TEST_PASSPHRASE").is_ok()
+        || env::var("WARD_UNSAFE_TEST_PASSPHRASE_SEQUENCE").is_ok()
+}
+
+fn derive_unsafe_test_api_material(
+    api: &ApiDerivedEnvelope,
+    client_factor: &[u8; KEY_LEN],
+) -> Result<Vec<u8>> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(UNSAFE_TEST_KEY_API_SECRET)
+        .expect("test HMAC key length is valid");
+    update_api_mac(&mut mac, api, client_factor);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn update_api_mac(mac: &mut HmacSha256, api: &ApiDerivedEnvelope, client_factor: &[u8; KEY_LEN]) {
+    mac.update(API_DERIVE_DOMAIN);
+    mac.update(b"\x00");
+    mac.update(api.server_key_id.as_bytes());
+    mac.update(b"\x00");
+    mac.update(api.vault_id.as_bytes());
+    mac.update(b"\x00");
+    mac.update(api.key_derivation_nonce.as_bytes());
+    mac.update(b"\x00");
+    mac.update(client_factor);
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiDeriveRequest {
+    version: u32,
+    vault_id: String,
+    key_derivation_nonce: String,
+    server_key_id: String,
+    client_kdf: ApiClientKdf,
+    client_factor: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiClientKdf {
+    name: String,
+    memory_cost: u32,
+    time_cost: u32,
+    parallelism: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiDeriveResponse {
+    version: u32,
+    server_key_id: String,
+    key_material: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +902,47 @@ mod tests {
             encrypt_env("DATABASE_URL=postgres://local\n", "correct passphrase").unwrap();
 
         assert!(decrypt_env(&envelope, "wrong passphrase").is_err());
+    }
+
+    #[test]
+    fn api_derived_vault_round_trips_without_raw_pin_api_in_tests() {
+        let _guard = env_lock();
+        std::env::set_var("WARD_UNSAFE_TEST_KEY_API", "1");
+        let plaintext = "DATABASE_URL=postgres://api-derived\n";
+        let envelope =
+            encrypt_env_with_key_mode(plaintext, "1234", VaultKeyMode::ApiDerivedV1).unwrap();
+
+        assert_eq!(envelope.version, 2);
+        assert_eq!(envelope.key_mode, VaultKeyMode::ApiDerivedV1);
+        assert!(envelope.api.is_some());
+        assert_eq!(decrypt_env(&envelope, "1234").unwrap(), plaintext);
+        assert!(decrypt_env(&envelope, "4321").is_err());
+        std::env::remove_var("WARD_UNSAFE_TEST_KEY_API");
+    }
+
+    #[test]
+    fn api_derived_nonce_separates_same_pin_vaults() {
+        let _guard = env_lock();
+        std::env::set_var("WARD_UNSAFE_TEST_KEY_API", "1");
+        let first = encrypt_env_with_key_mode(
+            "DATABASE_URL=postgres://one\n",
+            "1234",
+            VaultKeyMode::ApiDerivedV1,
+        )
+        .unwrap();
+        let second = encrypt_env_with_key_mode(
+            "DATABASE_URL=postgres://one\n",
+            "1234",
+            VaultKeyMode::ApiDerivedV1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            first.api.as_ref().unwrap().key_derivation_nonce,
+            second.api.as_ref().unwrap().key_derivation_nonce
+        );
+        assert_ne!(first.cipher.ciphertext, second.cipher.ciphertext);
+        std::env::remove_var("WARD_UNSAFE_TEST_KEY_API");
     }
 
     #[test]

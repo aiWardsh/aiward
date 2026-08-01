@@ -100,8 +100,10 @@ pub fn lock_plaintext_source(source: &Path, vault_path: &Path, passphrase: &str)
         );
     }
     vault::validate_dotenv(&plaintext)?;
-    let mut envelope = vault::encrypt_env(&plaintext, passphrase)?;
-    let _ = vault::read_vault(vault_path).map(|existing| envelope.created_at = existing.created_at);
+    let envelope = match vault::read_vault(vault_path) {
+        Ok(existing) => vault::encrypt_env_like(&existing, &plaintext, passphrase)?,
+        Err(_) => vault::encrypt_env(&plaintext, passphrase)?,
+    };
     vault::write_vault(vault_path, &envelope)?;
     vault::decrypt_vault_file(vault_path, passphrase)?;
     lock_env_file(source, vault_path)
@@ -225,8 +227,10 @@ pub fn serialize_env_map(env: &BTreeMap<String, String>) -> String {
 fn write_updated_vault(vault_path: &Path, passphrase: &str, plaintext: &str) -> Result<()> {
     ensure_not_locked_marker(plaintext, vault_path)?;
     vault::validate_dotenv(plaintext)?;
-    let mut envelope = vault::encrypt_env(plaintext, passphrase)?;
-    let _ = vault::read_vault(vault_path).map(|existing| envelope.created_at = existing.created_at);
+    let envelope = match vault::read_vault(vault_path) {
+        Ok(existing) => vault::encrypt_env_like(&existing, plaintext, passphrase)?,
+        Err(_) => vault::encrypt_env(plaintext, passphrase)?,
+    };
     vault::write_vault(vault_path, &envelope)?;
     vault::decrypt_vault_file(vault_path, passphrase)?;
     Ok(())

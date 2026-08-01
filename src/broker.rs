@@ -1972,7 +1972,11 @@ fn provision_project_with_material(
     config::ensure_env_example(&target_path)?;
     config::ensure_agent_instructions(&target_path, &request.project)?;
     config::ensure_gitignore(&target_path, true)?;
-    let envelope = vault::encrypt_env(&selected_plaintext, &material.passphrase)?;
+    let envelope = vault::encrypt_env_with_key_mode(
+        &selected_plaintext,
+        &material.passphrase,
+        vault::VaultKeyMode::ApiDerivedV1,
+    )?;
     vault::write_vault(&vault_path, &envelope)?;
     env_file::lock_env_file(&target_path.join(".env"), &vault_path)?;
     approval_receipts::ensure_project_key_after_vault_unlock(
@@ -2069,7 +2073,12 @@ pub(crate) fn setup_project_with_passphrase(
     config::ensure_gitignore(&target_path, true)?;
 
     let vault_path = target_path.join(config::DEFAULT_VAULT_FILE);
-    vault::import_env_file(&source, &vault_path, passphrase)?;
+    vault::import_env_file_with_key_mode(
+        &source,
+        &vault_path,
+        passphrase,
+        vault::VaultKeyMode::ApiDerivedV1,
+    )?;
     let plaintext = vault::decrypt_vault_file(&vault_path, passphrase)?;
     env_file::lock_env_file(&source, &vault_path)?;
     approval_receipts::ensure_project_key_after_vault_unlock(&project_config.project, passphrase)?;

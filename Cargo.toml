@@ -1,6 +1,6 @@
 [package]
 name = "aiward"
-version = "0.5.31"
+version = "0.5.32"
 edition = "2021"
 rust-version = "1.86"
 description = "Local-first AI secret firewall for development environments."
@@ -37,7 +37,10 @@ glob = "0.3"
 libc = "0.2"
 dotenvy = "0.15"
 ed25519-dalek = "2.1"
+hmac = "0.12"
+hkdf = "0.12"
 hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 inquire = "0.7"
 keyring = { version = "3.6", features = ["apple-native"] }
 rand = "0.8"

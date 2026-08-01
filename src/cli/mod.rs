@@ -8,9 +8,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dirs;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -60,6 +60,21 @@ pub struct Cli {
     pub command: Commands,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KeyModeArg {
+    ApiDerived,
+    LocalDerived,
+}
+
+impl From<KeyModeArg> for vault::VaultKeyMode {
+    fn from(value: KeyModeArg) -> Self {
+        match value {
+            KeyModeArg::ApiDerived => vault::VaultKeyMode::ApiDerivedV1,
+            KeyModeArg::LocalDerived => vault::VaultKeyMode::LocalDerivedV1,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Initialize, import, register, and create short profiles.
@@ -72,6 +87,8 @@ pub enum Commands {
         source: PathBuf,
         #[arg(long, default_value = config::DEFAULT_VAULT_FILE)]
         vault: PathBuf,
+        #[arg(long, value_enum, default_value_t = KeyModeArg::ApiDerived)]
+        key_mode: KeyModeArg,
         #[arg(long)]
         commit_vault: bool,
         #[arg(long)]
@@ -105,6 +122,8 @@ pub enum Commands {
         source: PathBuf,
         #[arg(long)]
         vault: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = KeyModeArg::ApiDerived)]
+        key_mode: KeyModeArg,
     },
     /// Register the current project in ~/.ward/registry.json.
     Register {
@@ -430,6 +449,15 @@ pub enum Commands {
         #[arg(long)]
         app: Option<String>,
     },
+    /// Manage vault key mode, migration, and offline recovery keys.
+    Key {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
     /// Manage recovery keys for this project.
     Recovery {
         #[arg(long)]
@@ -477,6 +505,12 @@ pub enum ProjectsCommand {
         path: Option<PathBuf>,
         #[arg(long)]
         vault: Option<PathBuf>,
+    },
+    /// Discover Ward projects under a root and add them to the global registry.
+    Discover {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     /// Select an already registered project as active.
     Use { project: String },
@@ -820,6 +854,27 @@ pub enum RecoveryCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum KeyCommand {
+    /// Show the current vault key mode and API-derived metadata.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-encrypt the vault into another key mode after validating the current PIN/passphrase.
+    Migrate {
+        #[arg(long, value_enum)]
+        to: KeyModeArg,
+    },
+    /// Export an encrypted offline recovery key file for this vault.
+    Export {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Import an encrypted offline recovery key file and rewrite the vault for local recovery.
+    Import { path: PathBuf },
+}
+
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Setup {
@@ -827,6 +882,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             project,
             source,
             vault,
+            key_mode,
             commit_vault,
             ignore_vault,
             remove_plaintext,
@@ -842,6 +898,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 project,
                 source,
                 vault,
+                key_mode: key_mode.into(),
                 commit_vault,
                 ignore_vault,
                 remove_plaintext,
@@ -860,7 +917,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             force,
             bare,
         } => init(project, force, bare),
-        Commands::Import { source, vault } => import(source, vault),
+        Commands::Import {
+            source,
+            vault,
+            key_mode,
+        } => import(source, vault, key_mode.into()),
         Commands::Register {
             project,
             path,
@@ -1076,6 +1137,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::BrokerServe => broker::serve(),
         Commands::ShellInit { shell } => shell_init(shell.as_deref()),
         Commands::Rotate { project, app } => rotate_vault(project, app),
+        Commands::Key {
+            project,
+            app,
+            command,
+        } => key_command(project, app, command),
         Commands::Recovery {
             project,
             app,
@@ -1326,8 +1392,28 @@ struct WardOnEvent<'a> {
 }
 
 #[derive(Debug, Clone)]
+struct ProjectDiscoveryCandidate {
+    display_name: String,
+    path: PathBuf,
+    vault: PathBuf,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectsDiscoverSummary {
+    root: PathBuf,
+    discovered: usize,
+    registered: usize,
+    updated: usize,
+    projects: Vec<registry::DiscoveryRegistration>,
+}
+
+#[derive(Debug, Clone)]
 struct WardOffTarget {
     project: String,
+    registry_key: String,
+    display_name: String,
     path: PathBuf,
     config: Option<config::ProjectConfig>,
     registered_vault: Option<PathBuf>,
@@ -1337,11 +1423,14 @@ struct WardOffTarget {
 #[serde(rename_all = "camelCase")]
 struct WardOffProjectStatus {
     project: String,
+    registry_key: String,
+    display_name: String,
     path: PathBuf,
     vault: Option<PathBuf>,
     output: Option<PathBuf>,
     status: String,
     message: String,
+    pin_attempts: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1371,6 +1460,7 @@ struct SetupOptions {
     project: Option<String>,
     source: PathBuf,
     vault: PathBuf,
+    key_mode: vault::VaultKeyMode,
     commit_vault: bool,
     ignore_vault: bool,
     remove_plaintext: bool,
@@ -1661,7 +1751,12 @@ fn setup(options: SetupOptions) -> Result<()> {
             let passphrase = vault::read_new_passphrase()?;
             term::blank();
             let sp = term::spinner("Encrypting local env");
-            vault::import_env_file(&source_path, &vault_path, &passphrase)?;
+            vault::import_env_file_with_key_mode(
+                &source_path,
+                &vault_path,
+                &passphrase,
+                options.key_mode,
+            )?;
             let plaintext = vault::decrypt_vault_file(&vault_path, &passphrase)?;
             verified_env_keys = Some(config::env_keys_from_dotenv_str(&plaintext)?);
             recovery_plaintext = Some(plaintext);
@@ -1681,7 +1776,7 @@ fn setup(options: SetupOptions) -> Result<()> {
         let passphrase = vault::read_new_passphrase()?;
         term::blank();
         let sp = term::spinner("Creating empty vault");
-        let envelope = vault::encrypt_env("", &passphrase)?;
+        let envelope = vault::encrypt_env_with_key_mode("", &passphrase, options.key_mode)?;
         vault::write_vault(&vault_path, &envelope)?;
         vault::decrypt_vault_file(&vault_path, &passphrase)?;
         env_file::lock_env_file(&source_path, &vault_path)?;
@@ -1804,7 +1899,15 @@ fn setup(options: SetupOptions) -> Result<()> {
 
     term::section("Recovery");
     if setup_passphrase_final.is_some() {
-        term::ok("vault recoverable with .env.vault + PIN/passphrase");
+        match options.key_mode {
+            vault::VaultKeyMode::ApiDerivedV1 => {
+                term::ok("vault recoverable with .env.vault + PIN/passphrase + Ward API");
+                term::next("optional offline safety: ward key export");
+            }
+            vault::VaultKeyMode::LocalDerivedV1 => {
+                term::ok("vault recoverable with .env.vault + PIN/passphrase");
+            }
+        }
     } else {
         term::warn("vault recovery not validated");
     }
@@ -1842,6 +1945,7 @@ fn init(project: Option<String>, force: bool, bare: bool) -> Result<()> {
             project,
             source: PathBuf::from(".env"),
             vault: PathBuf::from(config::DEFAULT_VAULT_FILE),
+            key_mode: vault::VaultKeyMode::ApiDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -1887,7 +1991,11 @@ fn init_bare(project: Option<String>, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
+fn import(
+    source: PathBuf,
+    explicit_vault: Option<PathBuf>,
+    key_mode: vault::VaultKeyMode,
+) -> Result<()> {
     let cwd = env::current_dir()?;
     let source_path = fs_util::resolve_project_path(&cwd, &source, "import source")?;
     let mut config =
@@ -1915,7 +2023,8 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
             }),
     };
 
-    let written = vault::import_env_file(&source_path, &vault_path, &passphrase)?;
+    let written =
+        vault::import_env_file_with_key_mode(&source_path, &vault_path, &passphrase, key_mode)?;
     vault::decrypt_vault_file(&written, &passphrase)?;
     env_file::lock_env_file(&source_path, &written)?;
     registry::update_project_vault(&config.project, cwd.clone(), written.clone())?;
@@ -1972,6 +2081,225 @@ fn register(project: String, path: Option<PathBuf>, explicit_vault: Option<PathB
     Ok(())
 }
 
+fn projects_discover(path: PathBuf, json: bool) -> Result<()> {
+    let summary = discover_and_register_projects(&path)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        term::emit_header(&term::Header {
+            command: Some("projects discover"),
+            project: "registry",
+            path: Some(&summary.root),
+            mode: None,
+        });
+        if summary.projects.is_empty() {
+            term::warn("no Ward projects discovered");
+            return Ok(());
+        }
+        term::section("projects");
+        for project in &summary.projects {
+            let status = if project.already_registered {
+                "updated"
+            } else {
+                "registered"
+            };
+            term::ok_detail(
+                &project.project,
+                &format!(
+                    "{status} name={} path={} vault={} source={}",
+                    project.display_name,
+                    term::short_path(&project.path),
+                    term::short_path(&project.vault),
+                    project.source
+                ),
+            );
+        }
+        term::info(&format!(
+            "{} discovered, {} registered, {} updated",
+            summary.discovered, summary.registered, summary.updated
+        ));
+    }
+    Ok(())
+}
+
+fn discover_and_register_projects(root: &Path) -> Result<ProjectsDiscoverSummary> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !root.exists() {
+        anyhow::bail!("discover root does not exist: {}", root.display());
+    }
+    let candidates = collect_project_discovery_candidates(&root)?;
+    let discovered = candidates.len();
+    let registrations = registry::upsert_discovered_projects(
+        candidates
+            .into_iter()
+            .map(|candidate| registry::DiscoveredProject {
+                display_name: candidate.display_name,
+                path: candidate.path,
+                vault: candidate.vault,
+                source: candidate.source,
+            })
+            .collect(),
+    )?;
+    let registered = registrations
+        .iter()
+        .filter(|project| !project.already_registered)
+        .count();
+    let updated = registrations.len().saturating_sub(registered);
+    Ok(ProjectsDiscoverSummary {
+        root,
+        discovered,
+        registered,
+        updated,
+        projects: registrations,
+    })
+}
+
+fn collect_project_discovery_candidates(root: &Path) -> Result<Vec<ProjectDiscoveryCandidate>> {
+    let mut candidates: BTreeMap<PathBuf, ProjectDiscoveryCandidate> = BTreeMap::new();
+    collect_config_backup_discovery_candidates(&mut candidates, root)?;
+    collect_filesystem_discovery_candidates(&mut candidates, root)?;
+    Ok(candidates.into_values().collect())
+}
+
+fn collect_config_backup_discovery_candidates(
+    candidates: &mut BTreeMap<PathBuf, ProjectDiscoveryCandidate>,
+    root: &Path,
+) -> Result<()> {
+    let dir = config::config_backups_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(backup) = serde_json::from_str::<config::ProjectConfigBackup>(&contents) else {
+            continue;
+        };
+        if !path_is_under(&backup.project_path, root) {
+            continue;
+        }
+        let Ok(vault) = config::resolve_vault_path_checked(&backup.project_path, &backup.config)
+        else {
+            continue;
+        };
+        add_project_discovery_candidate(
+            candidates,
+            ProjectDiscoveryCandidate {
+                display_name: backup.project,
+                path: backup.project_path,
+                vault,
+                source: "config-backup".to_string(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn collect_filesystem_discovery_candidates(
+    candidates: &mut BTreeMap<PathBuf, ProjectDiscoveryCandidate>,
+    root: &Path,
+) -> Result<()> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let config_path = config::config_path(&path);
+        let default_vault = path.join(config::DEFAULT_VAULT_FILE);
+        if let Ok(project_config) = config::read_project_config(&path) {
+            let Ok(vault) = config::resolve_vault_path_checked(&path, &project_config) else {
+                continue;
+            };
+            add_project_discovery_candidate(
+                candidates,
+                ProjectDiscoveryCandidate {
+                    display_name: project_config.project,
+                    path: path.clone(),
+                    vault,
+                    source: "config".to_string(),
+                },
+            );
+        } else if default_vault.exists() && !config_path.exists() {
+            let project = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+                .to_string();
+            add_project_discovery_candidate(
+                candidates,
+                ProjectDiscoveryCandidate {
+                    display_name: project,
+                    path: path.clone(),
+                    vault: default_vault,
+                    source: "vault".to_string(),
+                },
+            );
+        }
+
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                ".git" | ".ward" | "node_modules" | "target" | ".next" | ".turbo"
+            ) {
+                continue;
+            }
+            stack.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn add_project_discovery_candidate(
+    candidates: &mut BTreeMap<PathBuf, ProjectDiscoveryCandidate>,
+    candidate: ProjectDiscoveryCandidate,
+) {
+    let key = candidate
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.path.clone());
+    candidates
+        .entry(key)
+        .and_modify(|existing| {
+            if discovery_source_priority(&candidate.source)
+                < discovery_source_priority(&existing.source)
+            {
+                *existing = candidate.clone();
+            }
+        })
+        .or_insert(candidate);
+}
+
+fn discovery_source_priority(source: &str) -> u8 {
+    match source {
+        "config" => 0,
+        "config-backup" => 1,
+        "vault" => 2,
+        _ => 3,
+    }
+}
+
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    path.starts_with(root)
+}
+
 fn use_project(project: &str) -> Result<()> {
     registry::set_active_project(project)?;
     term::emit_header(&term::Header {
@@ -2005,12 +2333,18 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
                 } else {
                     "registered"
                 };
+                let display_name = project.display_name.as_deref().unwrap_or(&name);
+                let source = project.source.as_deref().unwrap_or("unknown");
+                let last_seen = project.last_seen_at.as_deref().unwrap_or("unknown");
                 term::ok_detail(
                     &name,
                     &format!(
-                        "{active} path={} vault={}",
+                        "{active} name={} path={} vault={} source={} lastSeen={}",
+                        display_name,
                         term::short_path(&project.path),
-                        term::short_path(&project.vault)
+                        term::short_path(&project.vault),
+                        source,
+                        last_seen
                     ),
                 );
             }
@@ -2018,19 +2352,34 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
         ProjectsCommand::Show { project } => {
             let cwd = env::current_dir()?;
             let resolved = registry::resolve_project(project.as_deref(), &cwd)?;
+            let registry = registry::list_projects()?;
+            let registered = registry.projects.get(&resolved.name);
             term::emit_header(&term::Header {
                 command: Some("projects show"),
                 project: &resolved.name,
                 path: Some(&resolved.path),
                 mode: None,
             });
+            if let Some(display_name) =
+                registered.and_then(|project| project.display_name.as_deref())
+            {
+                term::ok_detail("name", display_name);
+            }
             term::ok_detail("vault", &term::short_path(&resolved.vault));
+            if let Some(source) = registered.and_then(|project| project.source.as_deref()) {
+                term::ok_detail("source", source);
+            }
+            if let Some(last_seen) = registered.and_then(|project| project.last_seen_at.as_deref())
+            {
+                term::ok_detail("last seen", last_seen);
+            }
         }
         ProjectsCommand::Register {
             project,
             path,
             vault,
         } => register(project, path, vault)?,
+        ProjectsCommand::Discover { path, json } => projects_discover(path, json)?,
         ProjectsCommand::Use { project } => use_project(&project)?,
         ProjectsCommand::Remove { project } => {
             if registry::remove_project(&project)? {
@@ -5185,7 +5534,19 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
     term::section("recovery");
 
     if let Ok(cfg) = &project_config {
-        term::ok("primary recovery uses .env.vault + PIN/passphrase");
+        let configured_vault = doctor_vault_path(&cwd, cfg);
+        match vault::read_vault(&configured_vault) {
+            Ok(envelope) => {
+                term::ok_detail("vault key mode", envelope.key_mode.label());
+                if envelope.key_mode == vault::VaultKeyMode::ApiDerivedV1 {
+                    term::ok("clone-anywhere recovery uses .env.vault + PIN/passphrase + Ward API");
+                    term::info("offline fallback requires ward key export");
+                } else {
+                    term::ok("primary recovery uses .env.vault + PIN/passphrase");
+                }
+            }
+            Err(_) => term::warn("unable to inspect vault key mode"),
+        }
         if vault::test_passphrase().is_some() {
             let passphrase = vault::test_passphrase().unwrap();
             let vault_path = config::resolve_vault_path_with_passphrase(&cwd, cfg, &passphrase);
@@ -5617,20 +5978,21 @@ fn ward_off(discover: Option<PathBuf>, json: bool) -> Result<()> {
     broker::stop()?;
     global_disable::disable("ward off")?;
 
-    let targets = collect_ward_off_targets(discover.as_deref())?;
-    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let passphrase = if targets.is_empty() {
-        None
-    } else {
-        Some(vault::read_existing_passphrase()?)
+    let discovery_summary = match discover.as_deref() {
+        Some(root) => Some(discover_and_register_projects(root)?),
+        None => None,
     };
+    let targets = collect_ward_off_targets()?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
 
     let mut projects = Vec::new();
-    for target in targets {
-        projects.push(restore_ward_off_target(
+    let total = targets.len();
+    for (index, target) in targets.into_iter().enumerate() {
+        projects.push(restore_ward_off_target_with_retries(
             &target,
-            passphrase.as_deref().unwrap_or_default(),
             &timestamp,
+            index + 1,
+            total,
         ));
     }
 
@@ -5681,6 +6043,12 @@ fn ward_off(discover: Option<PathBuf>, json: bool) -> Result<()> {
         term::ok(&format!("revoked {revoked} session grant(s)"));
         term::ok(&format!("cleared {cleared_unlocks} unlock session(s)"));
         term::section("Env files");
+        if let Some(discovery_summary) = &discovery_summary {
+            term::ok(&format!(
+                "indexed {} discovered project(s)",
+                discovery_summary.projects.len()
+            ));
+        }
         if summary.projects.is_empty() {
             term::warn("no known Ward projects found");
         }
@@ -5731,13 +6099,10 @@ fn ward_on(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn collect_ward_off_targets(discover: Option<&Path>) -> Result<Vec<WardOffTarget>> {
+fn collect_ward_off_targets() -> Result<Vec<WardOffTarget>> {
     let mut targets: BTreeMap<(String, PathBuf), WardOffTarget> = BTreeMap::new();
     collect_registry_off_targets(&mut targets)?;
     collect_config_backup_off_targets(&mut targets)?;
-    if let Some(root) = discover {
-        collect_discovered_off_targets(&mut targets, root)?;
-    }
     Ok(targets.into_values().collect())
 }
 
@@ -5751,6 +6116,11 @@ fn collect_registry_off_targets(
         add_ward_off_target(
             targets,
             WardOffTarget {
+                display_name: registered
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| project.clone()),
+                registry_key: project.clone(),
                 project,
                 path: registered.path.clone(),
                 config: config::read_project_config(&registered.path).ok(),
@@ -5785,75 +6155,14 @@ fn collect_config_backup_off_targets(
         add_ward_off_target(
             targets,
             WardOffTarget {
+                display_name: backup.project.clone(),
+                registry_key: backup.project.clone(),
                 project: backup.project,
                 path: backup.project_path,
                 config: Some(backup.config),
                 registered_vault: None,
             },
         );
-    }
-    Ok(())
-}
-
-fn collect_discovered_off_targets(
-    targets: &mut BTreeMap<(String, PathBuf), WardOffTarget>,
-    root: &Path,
-) -> Result<()> {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    if !root.exists() {
-        anyhow::bail!("discover root does not exist: {}", root.display());
-    }
-    let mut stack = vec![root];
-    while let Some(path) = stack.pop() {
-        let config_path = config::config_path(&path);
-        let default_vault = path.join(config::DEFAULT_VAULT_FILE);
-        if let Ok(project_config) = config::read_project_config(&path) {
-            add_ward_off_target(
-                targets,
-                WardOffTarget {
-                    project: project_config.project.clone(),
-                    path: path.clone(),
-                    config: Some(project_config),
-                    registered_vault: default_vault.exists().then_some(default_vault),
-                },
-            );
-        } else if default_vault.exists() && !config_path.exists() {
-            let project = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("project")
-                .to_string();
-            add_ward_off_target(
-                targets,
-                WardOffTarget {
-                    project,
-                    path: path.clone(),
-                    config: None,
-                    registered_vault: Some(default_vault),
-                },
-            );
-        }
-
-        let Ok(entries) = fs::read_dir(&path) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if matches!(
-                name.as_ref(),
-                ".git" | ".ward" | "node_modules" | "target" | ".next" | ".turbo"
-            ) {
-                continue;
-            }
-            stack.push(entry.path());
-        }
     }
     Ok(())
 }
@@ -5887,15 +6196,19 @@ fn restore_ward_off_target(
     target: &WardOffTarget,
     passphrase: &str,
     timestamp: &str,
+    pin_attempts: usize,
 ) -> WardOffProjectStatus {
     if !target.path.is_dir() {
         return WardOffProjectStatus {
             project: target.project.clone(),
+            registry_key: target.registry_key.clone(),
+            display_name: target.display_name.clone(),
             path: target.path.clone(),
             vault: None,
             output: None,
             status: "skipped".to_string(),
             message: "project path missing".to_string(),
+            pin_attempts,
         };
     }
     let vault = match resolve_ward_off_vault_path(target, passphrase) {
@@ -5903,44 +6216,133 @@ fn restore_ward_off_target(
         Err(error) => {
             return WardOffProjectStatus {
                 project: target.project.clone(),
+                registry_key: target.registry_key.clone(),
+                display_name: target.display_name.clone(),
                 path: target.path.clone(),
                 vault: None,
                 output: None,
                 status: "failed".to_string(),
                 message: error.to_string(),
+                pin_attempts,
             }
         }
     };
     if !vault.exists() {
         return WardOffProjectStatus {
             project: target.project.clone(),
+            registry_key: target.registry_key.clone(),
+            display_name: target.display_name.clone(),
             path: target.path.clone(),
             vault: Some(vault),
             output: None,
             status: "skipped".to_string(),
             message: "vault missing".to_string(),
+            pin_attempts,
         };
     }
 
     let env_path = target.path.join(".env");
     match env_file::unlock_env_file_preserving_plaintext(&env_path, &vault, passphrase, timestamp) {
-        Ok(output) => WardOffProjectStatus {
-            project: target.project.clone(),
-            path: target.path.clone(),
-            vault: Some(vault),
-            output: Some(output),
-            status: "restored".to_string(),
-            message: "plaintext env written".to_string(),
-        },
+        Ok(output) => {
+            let _ = registry::refresh_project_vault(
+                &target.registry_key,
+                target.path.clone(),
+                vault.clone(),
+            );
+            WardOffProjectStatus {
+                project: target.project.clone(),
+                registry_key: target.registry_key.clone(),
+                display_name: target.display_name.clone(),
+                path: target.path.clone(),
+                vault: Some(vault),
+                output: Some(output),
+                status: "restored".to_string(),
+                message: "plaintext env written".to_string(),
+                pin_attempts,
+            }
+        }
         Err(error) => WardOffProjectStatus {
             project: target.project.clone(),
+            registry_key: target.registry_key.clone(),
+            display_name: target.display_name.clone(),
             path: target.path.clone(),
             vault: Some(vault),
             output: None,
             status: "failed".to_string(),
             message: error.to_string(),
+            pin_attempts,
         },
     }
+}
+
+fn restore_ward_off_target_with_retries(
+    target: &WardOffTarget,
+    timestamp: &str,
+    index: usize,
+    total: usize,
+) -> WardOffProjectStatus {
+    if !target.path.is_dir() {
+        return restore_ward_off_target(target, "", timestamp, 0);
+    }
+
+    const MAX_PIN_ATTEMPTS: usize = 3;
+    let mut last_status = None;
+    for attempt in 1..=MAX_PIN_ATTEMPTS {
+        eprintln!(
+            "Project {index}/{total}: {} ({})",
+            target.display_name,
+            target.path.display()
+        );
+        let passphrase = match vault::read_existing_passphrase_for_project(&target.display_name) {
+            Ok(passphrase) => passphrase,
+            Err(error) => {
+                return WardOffProjectStatus {
+                    project: target.project.clone(),
+                    registry_key: target.registry_key.clone(),
+                    display_name: target.display_name.clone(),
+                    path: target.path.clone(),
+                    vault: None,
+                    output: None,
+                    status: "failed".to_string(),
+                    message: error.to_string(),
+                    pin_attempts: attempt.saturating_sub(1),
+                }
+            }
+        };
+        let status = restore_ward_off_target(target, &passphrase, timestamp, attempt);
+        if status.status == "restored" {
+            return status;
+        }
+        let retryable = status_is_retryable(&status, target);
+        if !retryable {
+            return status;
+        }
+        if attempt == MAX_PIN_ATTEMPTS {
+            let mut status = status;
+            status.status = "failed".to_string();
+            return status;
+        }
+        eprintln!(
+            "  PIN/passphrase did not unlock {}; retrying ({}/{})",
+            target.display_name, attempt, MAX_PIN_ATTEMPTS
+        );
+        last_status = Some(status);
+    }
+    last_status.unwrap_or_else(|| restore_ward_off_target(target, "", timestamp, 0))
+}
+
+fn status_is_retryable(status: &WardOffProjectStatus, target: &WardOffTarget) -> bool {
+    status.status == "failed" && status.message.contains("passphrase may be incorrect")
+        || status.status == "skipped"
+            && status.message == "vault missing"
+            && target_uses_derived_vault(target)
+}
+
+fn target_uses_derived_vault(target: &WardOffTarget) -> bool {
+    target
+        .config
+        .as_ref()
+        .is_some_and(|config| !config.vault_nonce.is_empty())
 }
 
 fn resolve_ward_off_vault_path(target: &WardOffTarget, passphrase: &str) -> Result<PathBuf> {
@@ -6066,7 +6468,12 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
     let active_ttl = broker::active_session_expiry(&project_name, &old_vault)?
         .and_then(|expires_at| remaining_session_ttl(expires_at, chrono::Utc::now()));
 
-    let plaintext = vault::decrypt_vault_file(&old_vault, &passphrase)?;
+    let existing_envelope = vault::read_vault(&old_vault)?;
+    anyhow::ensure!(
+        existing_envelope.key_mode == vault::VaultKeyMode::LocalDerivedV1,
+        "api-derived vaults use stable .env.vault; run `ward key migrate --to api-derived` to re-key"
+    );
+    let plaintext = vault::decrypt_env(&existing_envelope, &passphrase)?;
     let new_vault = loop {
         config.vault_nonce = vault::generate_vault_nonce();
         let candidate = config::resolve_vault_path_dynamic(&cwd, &config, &passphrase);
@@ -6109,6 +6516,262 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
     term::ok_detail("vault rotated", &term::short_path(&new_vault));
     term::ok(".ward.json updated with new nonce");
     Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineRecoveryKeyFile {
+    version: u32,
+    kind: String,
+    created_at: String,
+    encrypted: vault::VaultEnvelope,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineRecoveryKeyBlob {
+    version: u32,
+    project: String,
+    key_mode: String,
+    passphrase: String,
+    vault_plaintext: String,
+}
+
+fn key_command(project: Option<String>, app: Option<String>, command: KeyCommand) -> Result<()> {
+    match command {
+        KeyCommand::Status { json } => key_status(project, app, json),
+        KeyCommand::Migrate { to } => key_migrate(project, app, to.into()),
+        KeyCommand::Export { output } => key_export(project, app, output),
+        KeyCommand::Import { path } => key_import(project, app, path),
+    }
+}
+
+fn key_status(project: Option<String>, app: Option<String>, json: bool) -> Result<()> {
+    let resolved = resolve_env_project(project, app)?;
+    let envelope = vault::read_vault(&resolved.vault)?;
+    if json {
+        let api = envelope.api.as_ref();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "project": resolved.name,
+                "path": resolved.path,
+                "vault": resolved.vault,
+                "keyMode": envelope.key_mode.label(),
+                "version": envelope.version,
+                "vaultId": api.map(|value| value.vault_id.clone()),
+                "keyDerivationNonce": api.map(|value| value.key_derivation_nonce.clone()),
+                "serverKeyId": api.map(|value| value.server_key_id.clone()),
+            }))?
+        );
+        return Ok(());
+    }
+
+    term::emit_header(&term::Header {
+        command: Some("key status"),
+        project: &resolved.name,
+        path: Some(&resolved.path),
+        mode: None,
+    });
+    term::ok_detail("key mode", envelope.key_mode.label());
+    term::ok_detail("vault", &term::short_path(&resolved.vault));
+    if let Some(api) = envelope.api.as_ref() {
+        term::ok_detail("vault id", &api.vault_id);
+        term::ok_detail("server key", &api.server_key_id);
+        term::info(
+            "api-derived vaults require Ward API unless an offline recovery key is exported",
+        );
+    }
+    Ok(())
+}
+
+fn key_migrate(
+    project: Option<String>,
+    app: Option<String>,
+    target_mode: vault::VaultKeyMode,
+) -> Result<()> {
+    let passphrase = vault::read_existing_passphrase()?;
+    let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
+    let mut config = config::read_project_config(&resolved.path)?;
+    let current = vault::read_vault(&resolved.vault)?;
+    let plaintext = vault::decrypt_env(&current, &passphrase)?;
+    if current.key_mode == target_mode {
+        term::emit_header(&term::Header {
+            command: Some("key migrate"),
+            project: &resolved.name,
+            path: Some(&resolved.path),
+            mode: None,
+        });
+        term::ok_detail("already using", target_mode.label());
+        return Ok(());
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let backup = key_backup_path(&resolved.vault, &timestamp);
+    let old_bytes = fs_util::read_file(&resolved.vault, "vault backup source")?;
+    fs_util::write_private_file(&backup, &old_bytes)?;
+
+    let new_vault = match target_mode {
+        vault::VaultKeyMode::ApiDerivedV1 => resolved.path.join(config::DEFAULT_VAULT_FILE),
+        vault::VaultKeyMode::LocalDerivedV1 => {
+            if config.vault_nonce.is_empty() {
+                config.vault_nonce = vault::generate_vault_nonce();
+            }
+            config::resolve_vault_path_dynamic(&resolved.path, &config, &passphrase)
+        }
+    };
+    let envelope = vault::encrypt_env_with_key_mode(&plaintext, &passphrase, target_mode)?;
+    vault::write_vault(&new_vault, &envelope)?;
+    if !same_path(&resolved.vault, &new_vault) && resolved.vault.exists() {
+        fs::remove_file(&resolved.vault).context(format!(
+            "failed to remove old vault {} after backup",
+            resolved.vault.display()
+        ))?;
+    }
+    config.vault = PathBuf::from(config::DEFAULT_VAULT_FILE);
+    config::write_project_config(&resolved.path, &config, true)?;
+    registry::update_project_vault(&resolved.name, resolved.path.clone(), new_vault.clone())?;
+    env_file::refresh_locked_env(&resolved.path, &new_vault)?;
+    warn_store_refresh_failure(project_store::refresh_from_plaintext(
+        &resolved.name,
+        &resolved.path,
+        &new_vault,
+        &config,
+        &plaintext,
+        &passphrase,
+    ));
+
+    term::emit_header(&term::Header {
+        command: Some("key migrate"),
+        project: &resolved.name,
+        path: Some(&resolved.path),
+        mode: None,
+    });
+    term::ok_detail("key mode", target_mode.label());
+    term::ok_detail("vault", &term::short_path(&new_vault));
+    term::ok_detail("backup", &term::short_path(&backup));
+    Ok(())
+}
+
+fn key_export(project: Option<String>, app: Option<String>, output: Option<PathBuf>) -> Result<()> {
+    let passphrase = vault::read_existing_passphrase()?;
+    let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
+    let envelope = vault::read_vault(&resolved.vault)?;
+    let plaintext = vault::decrypt_env(&envelope, &passphrase)?;
+    term::warn("offline recovery key can restore this vault without Ward API");
+    let recovery_passphrase = vault::read_new_pin(
+        "  New offline recovery PIN/passphrase: ",
+        "  Confirm offline recovery PIN/passphrase: ",
+    )?;
+    let blob = OfflineRecoveryKeyBlob {
+        version: 1,
+        project: resolved.name.clone(),
+        key_mode: envelope.key_mode.label().to_string(),
+        passphrase,
+        vault_plaintext: plaintext,
+    };
+    let encrypted = vault::encrypt_env_with_params(
+        &serde_json::to_string(&blob)?,
+        &recovery_passphrase,
+        65_536,
+        3,
+    )?;
+    let recovery_file = OfflineRecoveryKeyFile {
+        version: 1,
+        kind: "ward-offline-recovery-key".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        encrypted,
+    };
+    let output = output.unwrap_or_else(|| {
+        resolved.path.join(format!(
+            "ward-recovery-key-{}.json",
+            safe_file_slug(&resolved.name)
+        ))
+    });
+    let contents = serde_json::to_vec_pretty(&recovery_file)?;
+    fs_util::write_private_file(&output, &contents)?;
+    term::emit_header(&term::Header {
+        command: Some("key export"),
+        project: &resolved.name,
+        path: Some(&resolved.path),
+        mode: None,
+    });
+    term::ok_detail("offline recovery key", &term::short_path(&output));
+    term::warn("store this file somewhere safe; it can recover env plaintext");
+    Ok(())
+}
+
+fn key_import(project: Option<String>, app: Option<String>, path: PathBuf) -> Result<()> {
+    let resolved = resolve_env_project(project, app)?;
+    let path = fs_util::resolve_existing_external_file(&path, "offline recovery key")?;
+    let contents = fs_util::read_file_to_string(&path, "offline recovery key")?;
+    let recovery_file: OfflineRecoveryKeyFile =
+        serde_json::from_str(&contents).context("invalid offline recovery key file")?;
+    anyhow::ensure!(
+        recovery_file.version == 1 && recovery_file.kind == "ward-offline-recovery-key",
+        "unsupported offline recovery key file"
+    );
+    let recovery_passphrase = vault::read_existing_passphrase_for_project("offline recovery key")?;
+    let plaintext = vault::decrypt_env(&recovery_file.encrypted, &recovery_passphrase)?;
+    let blob: OfflineRecoveryKeyBlob =
+        serde_json::from_str(&plaintext).context("invalid offline recovery key payload")?;
+    anyhow::ensure!(
+        blob.version == 1,
+        "unsupported offline recovery key payload version {}",
+        blob.version
+    );
+    anyhow::ensure!(
+        blob.project == resolved.name,
+        "offline recovery key belongs to project {}; current project is {}",
+        blob.project,
+        resolved.name
+    );
+    let mut config = config::read_project_config(&resolved.path)?;
+    let target_vault = resolved.path.join(config::DEFAULT_VAULT_FILE);
+    let envelope = vault::encrypt_env_with_key_mode(
+        &blob.vault_plaintext,
+        &blob.passphrase,
+        vault::VaultKeyMode::LocalDerivedV1,
+    )?;
+    vault::write_vault(&target_vault, &envelope)?;
+    config.vault = PathBuf::from(config::DEFAULT_VAULT_FILE);
+    config::write_project_config(&resolved.path, &config, true)?;
+    registry::update_project_vault(&resolved.name, resolved.path.clone(), target_vault.clone())?;
+    env_file::refresh_locked_env(&resolved.path, &target_vault)?;
+    term::emit_header(&term::Header {
+        command: Some("key import"),
+        project: &resolved.name,
+        path: Some(&resolved.path),
+        mode: None,
+    });
+    term::ok_detail("vault restored", &term::short_path(&target_vault));
+    term::warn("vault was restored as local-derived; run ward key migrate --to api-derived when API access is available");
+    Ok(())
+}
+
+fn key_backup_path(vault: &Path, timestamp: &str) -> PathBuf {
+    let name = vault
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("env.vault");
+    vault.with_file_name(format!("{name}.ward-key-backup.{timestamp}"))
+}
+
+fn safe_file_slug(value: &str) -> String {
+    let mut slug = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 fn prompt_drag_drop_path() -> Result<std::path::PathBuf> {
@@ -7804,6 +8467,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         project: Some("coverage-main".to_string()),
         source: ".env".into(),
         vault: ".env.vault".into(),
+        key_mode: vault::VaultKeyMode::LocalDerivedV1,
         commit_vault: false,
         ignore_vault: false,
         remove_plaintext: false,
@@ -8365,6 +9029,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         project: Some("coverage-remove".to_string()),
         source: ".env".into(),
         vault: ".env.vault".into(),
+        key_mode: vault::VaultKeyMode::LocalDerivedV1,
         commit_vault: false,
         ignore_vault: false,
         remove_plaintext: true,
@@ -8392,6 +9057,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         project: Some("coverage-doctor".to_string()),
         source: ".env".into(),
         vault: ".env.vault".into(),
+        key_mode: vault::VaultKeyMode::LocalDerivedV1,
         commit_vault: false,
         ignore_vault: false,
         remove_plaintext: false,
@@ -8775,6 +9441,7 @@ mod tests {
                 project: Some("kept".to_string()),
                 source: ".env".into(),
                 vault: ".env.vault".into(),
+                key_mode: KeyModeArg::LocalDerived,
                 commit_vault: false,
                 ignore_vault: false,
                 remove_plaintext: false,
@@ -8802,6 +9469,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -8919,6 +9587,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -8999,6 +9668,7 @@ mod tests {
                 project: Some("demo".to_string()),
                 source: "missing.env".into(),
                 vault: "missing.vault".into(),
+                key_mode: KeyModeArg::LocalDerived,
                 commit_vault: true,
                 ignore_vault: true,
                 remove_plaintext: false,
@@ -9019,6 +9689,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: "missing.env".into(),
             vault: "missing.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: true,
@@ -9035,6 +9706,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: "missing.env".into(),
             vault: "missing.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9057,6 +9729,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: "missing.env".into(),
             vault: absolute_vault,
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9101,6 +9774,7 @@ mod tests {
             project: Some("new-demo".to_string()),
             source: "missing.env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9142,6 +9816,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9157,6 +9832,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9177,6 +9853,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9207,6 +9884,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: "../outside.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9223,6 +9901,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: "../outside.env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9245,9 +9924,13 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
 
-        let import_error = import("../outside.env".into(), None)
-            .unwrap_err()
-            .to_string();
+        let import_error = import(
+            "../outside.env".into(),
+            None,
+            vault::VaultKeyMode::LocalDerivedV1,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(import_error.contains("parent directory traversal"));
 
         let teardown_error = crate::project_teardown::teardown_project(ProjectTeardownRequest {
@@ -9288,6 +9971,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: true,
@@ -9330,6 +10014,7 @@ mod tests {
                 project: Some("demo".to_string()),
                 source: ".env".into(),
                 vault: ".env.vault".into(),
+                key_mode: KeyModeArg::LocalDerived,
                 commit_vault: false,
                 ignore_vault: false,
                 remove_plaintext: false,
@@ -9550,6 +10235,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9569,6 +10255,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: "missing.env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9592,6 +10279,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: ".env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9611,6 +10299,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: "missing.env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9634,6 +10323,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: "missing.env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9653,6 +10343,7 @@ mod tests {
             project: Some("demo".to_string()),
             source: "missing.env".into(),
             vault: ".env.vault".into(),
+            key_mode: vault::VaultKeyMode::LocalDerivedV1,
             commit_vault: false,
             ignore_vault: false,
             remove_plaintext: false,
@@ -9678,6 +10369,7 @@ mod tests {
                 project: Some("demo".to_string()),
                 source: ".env".into(),
                 vault: ".env.vault".into(),
+                key_mode: vault::VaultKeyMode::LocalDerivedV1,
                 commit_vault: false,
                 ignore_vault: false,
                 remove_plaintext: false,
@@ -9736,6 +10428,7 @@ mod tests {
             command: Commands::Import {
                 source: ".env".into(),
                 vault: None,
+                key_mode: KeyModeArg::LocalDerived,
             },
         })
         .unwrap();
@@ -9748,6 +10441,7 @@ mod tests {
             command: Commands::Import {
                 source: ".env.alt".into(),
                 vault: Some(".env.alt.vault".into()),
+                key_mode: KeyModeArg::LocalDerived,
             },
         })
         .unwrap();
@@ -10198,7 +10892,7 @@ mod tests {
         .unwrap();
 
         init(Some("demo".to_string()), false, true).unwrap();
-        import(".env".into(), None).unwrap();
+        import(".env".into(), None, vault::VaultKeyMode::LocalDerivedV1).unwrap();
         std::fs::remove_file(project.path().join(".env")).unwrap();
         register("demo".to_string(), None, None).unwrap();
         unlock_vault("1h", None, false).unwrap();
@@ -10620,7 +11314,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn ward_off_target_collection_dedupes_registry_backup_and_discovery() {
+    fn ward_off_target_collection_dedupes_registry_and_backup() {
         let _guard = cwd_lock();
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -10636,10 +11330,12 @@ mod tests {
         )
         .unwrap();
 
-        let targets = collect_ward_off_targets(Some(project.path())).unwrap();
+        let targets = collect_ward_off_targets().unwrap();
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].project, "demo");
+        assert_eq!(targets[0].registry_key, "demo");
+        assert_eq!(targets[0].display_name, "demo");
         assert!(same_path(&targets[0].path, project.path()));
         assert!(targets[0].config.is_some());
         assert!(targets[0].registered_vault.is_some());
@@ -10665,12 +11361,14 @@ mod tests {
         project_config.vault_nonce.clear();
         let target = WardOffTarget {
             project: "demo".to_string(),
+            registry_key: "demo".to_string(),
+            display_name: "demo".to_string(),
             path: project.path().to_path_buf(),
             config: Some(project_config),
             registered_vault: None,
         };
 
-        let status = restore_ward_off_target(&target, "1234", "20260731");
+        let status = restore_ward_off_target(&target, "1234", "20260731", 1);
 
         assert_eq!(status.status, "failed");
         assert!(status.message.contains("no usable vault path found"));
@@ -11171,6 +11869,7 @@ mod tests {
             "workspace",
             "config",
             "store",
+            "projects",
         ] {
             let rendered = command
                 .find_subcommand_mut(subcommand)
@@ -11226,6 +11925,7 @@ mod tests {
             vec!["ward", "use", "demo"],
             vec!["ward", "projects", "list"],
             vec!["ward", "projects", "show", "demo"],
+            vec!["ward", "projects", "discover", ".", "--json"],
             vec![
                 "ward",
                 "projects",
@@ -11416,6 +12116,19 @@ mod tests {
             vec!["ward", "edit"],
             vec!["ward", "unlock", "--ttl", "1h"],
             vec!["ward", "lock"],
+            vec!["ward", "key", "status"],
+            vec!["ward", "key", "status", "--json"],
+            vec!["ward", "key", "migrate", "--to", "api-derived"],
+            vec!["ward", "key", "migrate", "--to", "local-derived"],
+            vec!["ward", "key", "export"],
+            vec![
+                "ward",
+                "key",
+                "export",
+                "--output",
+                "ward-recovery-key.json",
+            ],
+            vec!["ward", "key", "import", "ward-recovery-key.json"],
             vec!["ward", "off"],
             vec!["ward", "off", "--discover", "."],
             vec!["ward", "on", "--json"],
@@ -11472,6 +12185,15 @@ mod tests {
                 Commands::Import {
                     source: ".env".into(),
                     vault: Some(".env.vault".into()),
+                    key_mode: KeyModeArg::LocalDerived,
+                }
+            ),
+            format!(
+                "{:?}",
+                Commands::Key {
+                    project: Some("demo".to_string()),
+                    app: None,
+                    command: KeyCommand::Status { json: true },
                 }
             ),
             format!(
@@ -11572,6 +12294,7 @@ mod tests {
                     project: Some("demo".to_string()),
                     source: ".env".into(),
                     vault: ".env.vault".into(),
+                    key_mode: KeyModeArg::LocalDerived,
                     commit_vault: true,
                     ignore_vault: false,
                     remove_plaintext: true,
@@ -11727,7 +12450,7 @@ mod tests {
             format!("{:?}", DashboardCommand::Tui),
         ];
 
-        assert_eq!(commands.len(), 37);
+        assert_eq!(commands.len(), 32);
         for value in commands {
             assert!(!value.is_empty());
         }

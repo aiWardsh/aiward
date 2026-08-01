@@ -127,6 +127,44 @@ ward modes status
 ward lock
 ```
 
+## Clone-anywhere encrypted envs
+
+New projects use API-derived vaults by default. The encrypted `.env.vault`
+contains public key-derivation metadata, while Ward derives the decrypt key from
+your PIN/passphrase plus the Ward key API. The raw PIN is not sent to the API.
+
+```bash
+ward setup                         # creates api-derived .env.vault by default
+ward import .env                   # imports with api-derived mode by default
+ward setup --key-mode local-derived
+ward import .env --key-mode local-derived
+```
+
+This lets a team commit `.env.vault`, clone the repo on another machine, and
+unlock with Ward plus the same PIN/passphrase:
+
+```bash
+git clone <repo>
+cd <repo>
+ward env unlock
+```
+
+Use `ward key status` to inspect the current key mode. Existing local-derived
+vaults keep working; migrate explicitly when ready:
+
+```bash
+ward key migrate --to api-derived
+ward key migrate --to local-derived
+```
+
+API-derived vaults require the Ward key API. Export an offline safety file if
+you need disaster recovery without the API:
+
+```bash
+ward key export --output ward-recovery-key.json
+ward key import ward-recovery-key.json
+```
+
 ## Global off/on
 
 Use `ward off` when you want Ward to stop intercepting normal terminal commands
@@ -141,13 +179,21 @@ Ward writes `~/.ward/disabled.json`, stops the local runtime, clears unlock
 sessions and session grants, then restores plaintext `.env` files for every
 known project it can decrypt. Known projects come from `~/.ward/registry.json`
 and `~/.ward/config-backups/`; `--discover` adds projects found under the given
-root. If one project uses a different PIN/passphrase or cannot be decrypted,
+root to the registry first. Ward prompts project by project, so projects may use
+different PINs/passphrases. If one project cannot be decrypted after retries,
 Ward reports that failure and continues with the others.
 
 Ward never deletes `.ward.json`, `.env.vault`, registry entries, grants, logs,
 recovery files, config backups, or generated agent instructions. If `.env`
 already contains non-Ward plaintext, Ward writes a sidecar file named
 `.env.ward-off.<timestamp>` instead of overwriting it.
+
+To refresh the global project registry without turning Ward off:
+
+```bash
+ward projects discover ~/Documents
+ward projects list
+```
 
 Turn Ward back on with:
 
@@ -391,8 +437,8 @@ Ward is designed for a specific threat: AI agents accessing secrets through comm
 
 Within that boundary, ward gives you hard guarantees:
 
-- **Vault rotation can move the vault to a derived filename.** The default vault file is `.env.vault`; `ward rotate` moves it to a passphrase-derived hidden filename and updates the registry and locked `.env` marker.
-- **PIN-derived vault encryption.** The vault on disk stays encrypted by your PIN/passphrase-derived key, so `.env.vault` plus the PIN/passphrase can decrypt after reinstall.
+- **API-derived vaults by default.** New `.env.vault` files can be committed and later unlocked from another machine with the PIN/passphrase plus Ward key API. The API returns key material only; encryption and decryption remain local.
+- **Local-derived vault compatibility.** Existing PIN-derived vaults still decrypt locally. Use `ward setup --key-mode local-derived` for offline-only projects.
 - **Authenticated broker operations.** Session-backed broker calls that execute commands, enumerate vault keys, sign approvals, or set up new projects require a trusted Ward client process and request authorization bound to the exact operation. Raw socket clients cannot bypass Ward policy just because a session is unlocked.
 - **Broker-owned approval authority.** Agents can request access and wait, but
   they cannot create approvals, claim `agent-mediated` approval, or decide that
@@ -401,7 +447,7 @@ Within that boundary, ward gives you hard guarantees:
   `session` approvals must match active broker state before envs decrypt;
   `branch` and `always` grants remain durable but are still broker-signed and
   matched to the exact command, env names, agent identity, and git context.
-- **Simple recovery.** Keep `.env.vault` and remember the PIN/passphrase. Four digits are convenient for daily testing, but weak if the encrypted vault leaks; longer PINs/passphrases improve offline resistance without changing the workflow.
+- **Simple recovery.** For API-derived vaults, keep `.env.vault` and remember the PIN/passphrase; export an offline recovery key if API availability is a concern. Four digits are convenient for daily testing, but weak without API rate limits; longer PINs/passphrases improve resistance without changing the workflow.
 - **Secrets are never written to disk in plaintext** during normal operation;
   `ward off` is the explicit reversible escape hatch that restores plaintext
   `.env` files for convenience.
@@ -416,7 +462,10 @@ Ward operates at the workflow layer, not the OS level. The protection is effecti
 ## Vault rotation and recovery
 
 ```bash
-ward rotate                         # rotate vault to a new derived filename
+ward key status                     # inspect api-derived vs local-derived mode
+ward key migrate --to api-derived   # explicit clone-anywhere migration
+ward key export                     # optional offline recovery key
+ward rotate                         # local-derived: rotate vault to a new derived filename
 ward recovery create                # optional legacy passphrase-protected recovery key
 ward recovery export                # save a backup to a safe location
 ward recovery import /path/to/file  # restore a recovery key from backup
