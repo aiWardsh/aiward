@@ -11,6 +11,7 @@ use crate::{fs_util, vault};
 
 const LOCKED_MARKER: &str = "# Ward managed locked .env";
 const VAULT_HASH_PREFIX: &str = "# ward-vault-sha256:";
+pub const WARD_OFF_SIDECAR_PREFIX: &str = ".env.ward-off.";
 const UNLOCKED_HEADER: &str = "\
 # Ward unlocked plaintext .env.
 # This file contains secrets for manual local development.
@@ -53,10 +54,25 @@ pub fn unlock_env_file_preserving_plaintext(
     passphrase: &str,
     timestamp: &str,
 ) -> Result<PathBuf> {
+    unlock_env_file_preserving_plaintext_with_sidecar_dir(
+        env_path, vault_path, passphrase, timestamp, None,
+    )
+}
+
+pub fn unlock_env_file_preserving_plaintext_with_sidecar_dir(
+    env_path: &Path,
+    vault_path: &Path,
+    passphrase: &str,
+    timestamp: &str,
+    sidecar_dir: Option<&Path>,
+) -> Result<PathBuf> {
     let plaintext = vault::decrypt_vault_file(vault_path, passphrase)?;
     ensure_not_locked_marker(&plaintext, vault_path)?;
     let output = if env_path.exists() && !is_locked_env_file(env_path)? {
-        sibling_with_file_name(env_path, &format!(".env.ward-off.{timestamp}"))
+        let file_name = format!("{WARD_OFF_SIDECAR_PREFIX}{timestamp}");
+        sidecar_dir
+            .map(|dir| dir.join(&file_name))
+            .unwrap_or_else(|| sibling_with_file_name(env_path, &file_name))
     } else {
         env_path.to_path_buf()
     };
@@ -173,6 +189,14 @@ pub fn is_locked_env_file(path: &Path) -> Result<bool> {
     }
     let contents = fs_util::read_file_to_string(path, "locked env file")?;
     Ok(is_locked_env_contents(&contents))
+}
+
+pub fn is_ward_unlocked_plaintext_file(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let contents = fs_util::read_file_to_string(path, "unlocked env file")?;
+    Ok(contents.starts_with("# Ward unlocked plaintext .env."))
 }
 
 pub fn is_locked_env_contents(contents: &str) -> bool {
@@ -450,6 +474,23 @@ mod tests {
             .unwrap()
             .contains("postgres://existing"));
         assert!(std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains("postgres://local"));
+
+        let ward_home_sidecars = tempdir.path().join("ward-off-envs/demo");
+        let private_sidecar = unlock_env_file_preserving_plaintext_with_sidecar_dir(
+            &env_path,
+            &vault_path,
+            "passphrase",
+            "20260801",
+            Some(&ward_home_sidecars),
+        )
+        .unwrap();
+        assert_eq!(
+            private_sidecar,
+            ward_home_sidecars.join(".env.ward-off.20260801")
+        );
+        assert!(std::fs::read_to_string(&private_sidecar)
             .unwrap()
             .contains("postgres://local"));
 

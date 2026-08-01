@@ -403,8 +403,11 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Re-enable Ward globally without deleting plaintext env files.
+    /// Re-enable Ward globally and re-encrypt Ward-created plaintext env files.
     On {
+        /// Prompt separately for each project instead of reusing one PIN/passphrase for all projects.
+        #[arg(long)]
+        each: bool,
         /// Print machine-readable enable summary.
         #[arg(long)]
         json: bool,
@@ -1131,7 +1134,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             each,
             json,
         } => ward_off(discover, each, json),
-        Commands::On { json } => ward_on(json),
+        Commands::On { each, json } => ward_on(each, json),
         Commands::Teardown {
             project,
             app,
@@ -1396,6 +1399,9 @@ struct WardOnEvent<'a> {
     event_type: &'static str,
     disabled_path: &'a Path,
     removed_disabled_state: bool,
+    locked: usize,
+    skipped: usize,
+    failed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1453,12 +1459,30 @@ struct WardOffSummary {
     projects: Vec<WardOffProjectStatus>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WardOnProjectStatus {
+    project: String,
+    registry_key: String,
+    display_name: String,
+    path: PathBuf,
+    vault: Option<PathBuf>,
+    locked_files: Vec<PathBuf>,
+    status: String,
+    message: String,
+    pin_attempts: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WardOnSummary {
     disabled: bool,
     disabled_path: PathBuf,
     removed_disabled_state: bool,
+    locked: usize,
+    skipped: usize,
+    failed: usize,
+    projects: Vec<WardOnProjectStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -6105,26 +6129,343 @@ fn ward_off(discover: Option<PathBuf>, each: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn ward_on(json: bool) -> Result<()> {
+fn ward_on(each: bool, json: bool) -> Result<()> {
     let removed = global_disable::enable()?;
+    let targets = collect_ward_off_targets()?;
+
+    let mut projects = Vec::new();
+    let total = targets.len();
+    if each {
+        for (index, target) in targets.into_iter().enumerate() {
+            projects.push(lock_ward_on_target_with_retries(&target, index + 1, total));
+        }
+    } else {
+        let passphrase = if targets.iter().any(|target| target.path.is_dir()) {
+            Some(vault::read_existing_passphrase()?)
+        } else {
+            None
+        };
+        for target in targets {
+            projects.push(lock_ward_on_target(
+                &target,
+                passphrase.as_deref().unwrap_or(""),
+                usize::from(passphrase.is_some()),
+            ));
+        }
+    }
+
+    let locked = projects
+        .iter()
+        .filter(|project| project.status == "locked")
+        .count();
+    let skipped = projects
+        .iter()
+        .filter(|project| project.status == "skipped")
+        .count();
+    let failed = projects
+        .iter()
+        .filter(|project| project.status == "failed")
+        .count();
+
     let summary = WardOnSummary {
         disabled: false,
         disabled_path: global_disable::disabled_path(),
         removed_disabled_state: removed,
+        locked,
+        skipped,
+        failed,
+        projects,
     };
     let event = WardOnEvent {
         event_type: "ward.on",
         disabled_path: &summary.disabled_path,
         removed_disabled_state: removed,
+        locked,
+        skipped,
+        failed,
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
-        println!(
-            "Ward enabled. Plaintext .env files may still exist; run ward env lock when ready."
+        term::section("Global");
+        if removed {
+            term::ok(&format!(
+                "Ward enabled  removed {}",
+                term::short_path(&summary.disabled_path)
+            ));
+        } else {
+            term::ok("Ward enabled");
+        }
+        term::section("Env files");
+        if summary.projects.is_empty() {
+            term::warn("no known Ward projects found");
+        }
+        for project in &summary.projects {
+            match project.status.as_str() {
+                "locked" => term::ok(&format!(
+                    "{}  {} file(s) locked",
+                    project.project,
+                    project.locked_files.len()
+                )),
+                "skipped" => term::warn(&format!("{}  {}", project.project, project.message)),
+                _ => term::fail(&format!("{}  {}", project.project, project.message)),
+            }
+        }
+        term::info(&format!(
+            "{locked} locked, {skipped} skipped, {failed} failed"
+        ));
+    }
+    Ok(())
+}
+
+fn lock_ward_on_target(
+    target: &WardOffTarget,
+    passphrase: &str,
+    pin_attempts: usize,
+) -> WardOnProjectStatus {
+    if !target.path.is_dir() {
+        return WardOnProjectStatus {
+            project: target.project.clone(),
+            registry_key: target.registry_key.clone(),
+            display_name: target.display_name.clone(),
+            path: target.path.clone(),
+            vault: None,
+            locked_files: Vec::new(),
+            status: "skipped".to_string(),
+            message: "project path missing".to_string(),
+            pin_attempts,
+        };
+    }
+    let vault = match resolve_ward_off_vault_path(target, passphrase) {
+        Ok(vault) => vault,
+        Err(error) => {
+            return WardOnProjectStatus {
+                project: target.project.clone(),
+                registry_key: target.registry_key.clone(),
+                display_name: target.display_name.clone(),
+                path: target.path.clone(),
+                vault: None,
+                locked_files: Vec::new(),
+                status: "failed".to_string(),
+                message: error.to_string(),
+                pin_attempts,
+            }
+        }
+    };
+    if !vault.exists() {
+        return WardOnProjectStatus {
+            project: target.project.clone(),
+            registry_key: target.registry_key.clone(),
+            display_name: target.display_name.clone(),
+            path: target.path.clone(),
+            vault: Some(vault),
+            locked_files: Vec::new(),
+            status: "skipped".to_string(),
+            message: "vault missing".to_string(),
+            pin_attempts,
+        };
+    }
+
+    let plan = match ward_on_lock_plan(target, &vault) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return WardOnProjectStatus {
+                project: target.project.clone(),
+                registry_key: target.registry_key.clone(),
+                display_name: target.display_name.clone(),
+                path: target.path.clone(),
+                vault: Some(vault),
+                locked_files: Vec::new(),
+                status: "failed".to_string(),
+                message: error.to_string(),
+                pin_attempts,
+            }
+        }
+    };
+    let Some(primary_source) = plan.primary_source else {
+        return WardOnProjectStatus {
+            project: target.project.clone(),
+            registry_key: target.registry_key.clone(),
+            display_name: target.display_name.clone(),
+            path: target.path.clone(),
+            vault: Some(vault),
+            locked_files: Vec::new(),
+            status: "skipped".to_string(),
+            message: "no Ward off plaintext env files found".to_string(),
+            pin_attempts,
+        };
+    };
+
+    let mut locked_files = Vec::new();
+    if let Err(error) = env_file::lock_plaintext_source(&primary_source, &vault, passphrase) {
+        return WardOnProjectStatus {
+            project: target.project.clone(),
+            registry_key: target.registry_key.clone(),
+            display_name: target.display_name.clone(),
+            path: target.path.clone(),
+            vault: Some(vault),
+            locked_files,
+            status: "failed".to_string(),
+            message: error.to_string(),
+            pin_attempts,
+        };
+    }
+    locked_files.push(primary_source);
+
+    let mut marker_errors = Vec::new();
+    for stale_source in plan.marker_only_sources {
+        match env_file::lock_env_file(&stale_source, &vault) {
+            Ok(()) => locked_files.push(stale_source),
+            Err(error) => marker_errors.push(error.to_string()),
+        }
+    }
+    if !marker_errors.is_empty() {
+        return WardOnProjectStatus {
+            project: target.project.clone(),
+            registry_key: target.registry_key.clone(),
+            display_name: target.display_name.clone(),
+            path: target.path.clone(),
+            vault: Some(vault),
+            locked_files,
+            status: "failed".to_string(),
+            message: marker_errors.join("; "),
+            pin_attempts,
+        };
+    }
+
+    let _ =
+        registry::refresh_project_vault(&target.registry_key, target.path.clone(), vault.clone());
+    WardOnProjectStatus {
+        project: target.project.clone(),
+        registry_key: target.registry_key.clone(),
+        display_name: target.display_name.clone(),
+        path: target.path.clone(),
+        vault: Some(vault),
+        locked_files,
+        status: "locked".to_string(),
+        message: "plaintext env re-encrypted".to_string(),
+        pin_attempts,
+    }
+}
+
+fn lock_ward_on_target_with_retries(
+    target: &WardOffTarget,
+    index: usize,
+    total: usize,
+) -> WardOnProjectStatus {
+    if !target.path.is_dir() {
+        return lock_ward_on_target(target, "", 0);
+    }
+
+    const MAX_PIN_ATTEMPTS: usize = 3;
+    let mut last_status = None;
+    for attempt in 1..=MAX_PIN_ATTEMPTS {
+        eprintln!(
+            "Project {index}/{total}: {} ({})",
+            target.display_name,
+            target.path.display()
         );
+        let passphrase = match vault::read_existing_passphrase_for_project(&target.display_name) {
+            Ok(passphrase) => passphrase,
+            Err(error) => {
+                return WardOnProjectStatus {
+                    project: target.project.clone(),
+                    registry_key: target.registry_key.clone(),
+                    display_name: target.display_name.clone(),
+                    path: target.path.clone(),
+                    vault: None,
+                    locked_files: Vec::new(),
+                    status: "failed".to_string(),
+                    message: error.to_string(),
+                    pin_attempts: attempt.saturating_sub(1),
+                }
+            }
+        };
+        let status = lock_ward_on_target(target, &passphrase, attempt);
+        if status.status == "locked" || status.status == "skipped" {
+            return status;
+        }
+        let retryable = status.message.contains("passphrase may be incorrect")
+            || status.message == "vault missing" && target_uses_derived_vault(target);
+        if !retryable {
+            return status;
+        }
+        if attempt == MAX_PIN_ATTEMPTS {
+            return status;
+        }
+        eprintln!(
+            "  PIN/passphrase did not unlock {}; retrying ({}/{})",
+            target.display_name, attempt, MAX_PIN_ATTEMPTS
+        );
+        last_status = Some(status);
+    }
+    last_status.unwrap_or_else(|| lock_ward_on_target(target, "", 0))
+}
+
+#[derive(Debug)]
+struct WardOnLockPlan {
+    primary_source: Option<PathBuf>,
+    marker_only_sources: Vec<PathBuf>,
+}
+
+fn ward_on_lock_plan(target: &WardOffTarget, vault: &Path) -> Result<WardOnLockPlan> {
+    let env_path = target.path.join(".env");
+    let primary_env = if matches!(
+        env_file::inspect_env_file(&env_path, vault)?,
+        env_file::EnvFileState::Plaintext
+    ) && env_file::is_ward_unlocked_plaintext_file(&env_path)?
+    {
+        Some(env_path)
+    } else {
+        None
+    };
+
+    let mut sidecars = Vec::new();
+    for path in collect_ward_on_sidecar_files(target)? {
+        if env_file::is_ward_unlocked_plaintext_file(&path)? {
+            sidecars.push(path);
+        }
+    }
+    let primary_sidecar = if primary_env.is_none() {
+        sidecars.pop()
+    } else {
+        None
+    };
+    let primary_source = primary_env.or(primary_sidecar);
+
+    Ok(WardOnLockPlan {
+        primary_source,
+        marker_only_sources: sidecars,
+    })
+}
+
+fn collect_ward_on_sidecar_files(target: &WardOffTarget) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    push_ward_on_sidecars_from_dir(&mut paths, &ward_off_sidecar_dir(target))?;
+    push_ward_on_sidecars_from_dir(&mut paths, &target.path)?;
+    paths.sort();
+    paths.dedup_by(|left, right| same_path(left, right));
+    Ok(paths)
+}
+
+fn push_ward_on_sidecars_from_dir(paths: &mut Vec<PathBuf>, dir: &Path) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with(env_file::WARD_OFF_SIDECAR_PREFIX) {
+            push_unique_path(paths, path);
+        }
     }
     Ok(())
 }
@@ -6272,7 +6613,14 @@ fn restore_ward_off_target(
     }
 
     let env_path = target.path.join(".env");
-    match env_file::unlock_env_file_preserving_plaintext(&env_path, &vault, passphrase, timestamp) {
+    let sidecar_dir = ward_off_sidecar_dir(target);
+    match env_file::unlock_env_file_preserving_plaintext_with_sidecar_dir(
+        &env_path,
+        &vault,
+        passphrase,
+        timestamp,
+        Some(&sidecar_dir),
+    ) {
         Ok(output) => {
             let _ = registry::refresh_project_vault(
                 &target.registry_key,
@@ -6303,6 +6651,20 @@ fn restore_ward_off_target(
             pin_attempts,
         },
     }
+}
+
+fn ward_off_sidecar_dir(target: &WardOffTarget) -> PathBuf {
+    let project_path = target
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| target.path.clone());
+    let mut hasher = Sha256::new();
+    hasher.update(project_path.to_string_lossy().as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    let dir_name = format!("{}-{}", safe_file_slug(&target.registry_key), &hash[..12]);
+    let relative = PathBuf::from("ward-off-envs").join(dir_name);
+    fs_util::resolve_ward_home_path(&relative, "ward off env directory")
+        .expect("ward off env directory should stay inside Ward home")
 }
 
 fn restore_ward_off_target_with_retries(
@@ -12458,7 +12820,13 @@ mod tests {
                     json: true,
                 }
             ),
-            format!("{:?}", Commands::On { json: true }),
+            format!(
+                "{:?}",
+                Commands::On {
+                    each: true,
+                    json: true,
+                }
+            ),
             format!(
                 "{:?}",
                 GrantsCommand::Revoke {

@@ -187,8 +187,9 @@ Ward reports that failure and continues with the others.
 
 Ward never deletes `.ward.json`, `.env.vault`, registry entries, grants, logs,
 recovery files, config backups, or generated agent instructions. If `.env`
-already contains non-Ward plaintext, Ward writes a sidecar file named
-`.env.ward-off.<timestamp>` instead of overwriting it.
+already contains non-Ward plaintext, Ward writes a private sidecar file under
+`~/.ward/ward-off-envs/` instead of overwriting or cluttering the project
+folder.
 
 To refresh the global project registry without turning Ward off:
 
@@ -201,11 +202,14 @@ Turn Ward back on with:
 
 ```bash
 ward on
+ward on --each
 ```
 
-`ward on` only removes `~/.ward/disabled.json`. It does not relock plaintext
-`.env` files; run `ward env lock` in each project when you are ready to return
-to normal encrypted operation.
+`ward on` removes `~/.ward/disabled.json` and re-encrypts Ward-created
+plaintext `.env` outputs back into their vaults. By default it prompts once and
+tries that PIN/passphrase for every known project. Use `--each` when projects
+use different PINs/passphrases. Ward leaves pre-existing non-Ward `.env` files
+alone and locks any Ward-home sidecar files it created during `ward off`.
 
 ---
 

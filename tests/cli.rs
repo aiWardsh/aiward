@@ -414,7 +414,7 @@ fn api_derived_vault_unlocks_after_clone_with_fresh_ward_home() {
 }
 
 #[test]
-fn off_disables_ward_restores_plaintext_env_and_on_reenables_without_deleting_files() {
+fn off_disables_ward_restores_plaintext_env_and_on_reencrypts_files() {
     let fixture = TestProject::new();
 
     fixture.setup_yes();
@@ -445,19 +445,94 @@ fn off_disables_ward_restores_plaintext_env_and_on_reenables_without_deleting_fi
 
     fixture
         .command()
-        .args(["on"])
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["on", "--json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Ward enabled. Plaintext .env files may still exist; run ward env lock when ready.",
-        ));
+        .stdout(
+            predicate::str::contains("\"disabled\": false")
+                .and(predicate::str::contains("\"locked\": 1"))
+                .and(predicate::str::contains("\"failed\": 0")),
+        );
 
     assert!(!fixture.ward_home.path().join("disabled.json").exists());
     assert!(fixture.project_dir.path().join(".ward.json").exists());
     assert!(fixture.project_dir.path().join(".env.vault").exists());
-    let env_contents_after_on =
-        std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
-    assert!(env_contents_after_on.contains("DATABASE_URL=postgres://secret"));
+    assert!(ward::env_file::is_locked_env_file(&fixture.project_dir.path().join(".env")).unwrap());
+}
+
+#[test]
+fn off_writes_sidecar_plaintext_under_ward_home_when_env_has_user_content() {
+    let fixture = TestProject::new();
+
+    fixture.setup_yes();
+    std::fs::write(
+        fixture.project_dir.path().join(".env"),
+        "DATABASE_URL=postgres://existing\n",
+    )
+    .unwrap();
+
+    let output = fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["off", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"disabled\": true")
+                .and(predicate::str::contains("\"restored\": 1"))
+                .and(predicate::str::contains("\"failed\": 0")),
+        )
+        .get_output()
+        .stdout
+        .clone();
+    let summary: Value = serde_json::from_slice(&output).unwrap();
+    let sidecar = PathBuf::from(summary["projects"][0]["output"].as_str().unwrap());
+
+    assert!(sidecar.starts_with(fixture.ward_home.path().join("ward-off-envs")));
+    assert!(sidecar
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with(".env.ward-off."));
+    let project_sidecars = std::fs::read_dir(fixture.project_dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".env.ward-off.")
+        })
+        .count();
+    assert_eq!(project_sidecars, 0);
+    assert!(
+        std::fs::read_to_string(fixture.project_dir.path().join(".env"))
+            .unwrap()
+            .contains("DATABASE_URL=postgres://existing")
+    );
+    assert!(std::fs::read_to_string(&sidecar)
+        .unwrap()
+        .contains("DATABASE_URL=postgres://secret"));
+
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["on", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"disabled\": false")
+                .and(predicate::str::contains("\"locked\": 1"))
+                .and(predicate::str::contains("\"failed\": 0")),
+        );
+
+    assert!(
+        std::fs::read_to_string(fixture.project_dir.path().join(".env"))
+            .unwrap()
+            .contains("DATABASE_URL=postgres://existing")
+    );
+    assert!(ward::env_file::is_locked_env_file(&sidecar).unwrap());
 }
 
 #[test]
