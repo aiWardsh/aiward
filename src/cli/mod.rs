@@ -6473,7 +6473,7 @@ fn push_ward_on_sidecars_from_dir(paths: &mut Vec<PathBuf>, dir: &Path) -> Resul
 fn collect_ward_off_targets() -> Result<Vec<WardOffTarget>> {
     let mut targets: BTreeMap<(String, PathBuf), WardOffTarget> = BTreeMap::new();
     collect_registry_off_targets(&mut targets)?;
-    collect_config_backup_off_targets(&mut targets)?;
+    merge_config_backup_off_target_metadata(&mut targets)?;
     Ok(targets.into_values().collect())
 }
 
@@ -6502,7 +6502,7 @@ fn collect_registry_off_targets(
     Ok(())
 }
 
-fn collect_config_backup_off_targets(
+fn merge_config_backup_off_target_metadata(
     targets: &mut BTreeMap<(String, PathBuf), WardOffTarget>,
 ) -> Result<()> {
     let dir = config::config_backups_dir();
@@ -6523,17 +6523,12 @@ fn collect_config_backup_off_targets(
         let Ok(backup) = serde_json::from_str::<config::ProjectConfigBackup>(&contents) else {
             continue;
         };
-        add_ward_off_target(
-            targets,
-            WardOffTarget {
-                display_name: backup.project.clone(),
-                registry_key: backup.project.clone(),
-                project: backup.project,
-                path: backup.project_path,
-                config: Some(backup.config),
-                registered_vault: None,
-            },
-        );
+        let key = ward_off_target_key(&backup.project, &backup.project_path);
+        if let Some(existing) = targets.get_mut(&key) {
+            if existing.config.is_none() {
+                existing.config = Some(backup.config);
+            }
+        }
     }
     Ok(())
 }
@@ -11706,7 +11701,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn ward_off_target_collection_dedupes_registry_and_backup() {
+    fn ward_off_target_collection_uses_registry_and_merges_matching_backup() {
         let _guard = cwd_lock();
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -11737,7 +11732,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn projects_remove_deletes_backup_only_tracking() {
+    fn ward_off_target_collection_ignores_backup_only_projects() {
         let _guard = cwd_lock();
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -11747,7 +11742,25 @@ mod tests {
             ProjectConfig::default_for_dir(project.path(), Some("stale-demo".to_string())).unwrap();
         config::write_project_config(project.path(), &config, false).unwrap();
         assert!(config::config_backup_path("stale-demo").exists());
-        assert_eq!(collect_ward_off_targets().unwrap().len(), 1);
+
+        assert!(collect_ward_off_targets().unwrap().is_empty());
+
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn projects_remove_deletes_backup_only_config_backup() {
+        let _guard = cwd_lock();
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+
+        let config =
+            ProjectConfig::default_for_dir(project.path(), Some("stale-demo".to_string())).unwrap();
+        config::write_project_config(project.path(), &config, false).unwrap();
+        assert!(config::config_backup_path("stale-demo").exists());
+        assert!(collect_ward_off_targets().unwrap().is_empty());
 
         projects_command(ProjectsCommand::Remove {
             project: "stale-demo".to_string(),

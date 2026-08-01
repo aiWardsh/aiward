@@ -274,8 +274,10 @@ Ward will:
 - write `~/.ward/disabled.json`;
 - restore plaintext env files for known projects it can decrypt.
 
-Known projects come from `~/.ward/registry.json` plus
-`~/.ward/config-backups/`. Refresh tracking with:
+Known projects come from `~/.ward/registry.json`. Local config backups under
+`~/.ward/config-backups/` are used as metadata recovery for registered projects,
+but backup-only projects are not treated as active `ward off` targets. Refresh
+or clean project tracking with:
 
 ```bash
 ward projects discover ~/Documents
