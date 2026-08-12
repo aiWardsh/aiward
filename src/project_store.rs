@@ -214,7 +214,7 @@ pub fn record_from_plaintext(
     let data_key = random_data_key();
     let payload = vault::encrypt_env(plaintext, &data_key)?;
     let key_mode = vault::read_vault(vault_path)
-        .map(|envelope| envelope.key_mode)
+        .map(|envelope| envelope.key_mode())
         .unwrap_or(vault::VaultKeyMode::LocalDerivedV1);
     let key_wrap = vault::encrypt_env_with_key_mode(&data_key, passphrase, key_mode)?;
 

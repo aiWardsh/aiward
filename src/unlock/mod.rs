@@ -131,7 +131,7 @@ pub fn active_run_passphrase(project: &str, vault: &Path) -> Result<Option<Strin
     #[cfg(not(test))]
     {
         let _ = session;
-        return Ok(None);
+        Ok(None)
     }
     #[cfg(test)]
     key_store::get_secret(&session.key_name)
@@ -144,9 +144,9 @@ pub fn active_run_lookup(project: &str, vault: &Path) -> Result<RunUnlockLookup>
     #[cfg(not(test))]
     {
         let _ = session;
-        return Ok(RunUnlockLookup::MaterialUnavailable {
+        Ok(RunUnlockLookup::MaterialUnavailable {
             reason: "broker_unlock_only".to_string(),
-        });
+        })
     }
     #[cfg(test)]
     match key_store::get_secret(&session.key_name) {
@@ -171,9 +171,9 @@ pub fn active_run_signing_key(project: &str, vault: &Path) -> Result<RunSigningL
     #[cfg(not(test))]
     {
         let _ = session;
-        return Ok(RunSigningLookup::MaterialUnavailable {
+        Ok(RunSigningLookup::MaterialUnavailable {
             reason: "signing_key_unavailable".to_string(),
-        });
+        })
     }
     #[cfg(test)]
     {
@@ -237,10 +237,8 @@ fn clear_unlocks_matching(mut should_remove: impl FnMut(&UnlockSession) -> bool)
     let mut removed_keys = Vec::new();
     state.sessions.retain(|session| {
         let remove = should_remove(session);
-        if remove {
-            if session.purpose == UnlockPurpose::Logs {
-                removed_keys.push(session.key_name.clone());
-            }
+        if remove && session.purpose == UnlockPurpose::Logs {
+            removed_keys.push(session.key_name.clone());
         }
         !remove
     });
@@ -333,10 +331,8 @@ fn remove_expired_and_matching(
             || (session.project == project
                 && session.vault == vault
                 && session.purpose == *purpose);
-        if should_remove {
-            if session.purpose == UnlockPurpose::Logs {
-                removed.push(session.key_name.clone());
-            }
+        if should_remove && session.purpose == UnlockPurpose::Logs {
+            removed.push(session.key_name.clone());
         }
         !should_remove
     });
@@ -350,10 +346,8 @@ fn remove_expired(state: &mut UnlockState, now: DateTime<Utc>) -> Result<()> {
     let mut removed = Vec::new();
     state.sessions.retain(|session| {
         let expired = session.expires_at <= now;
-        if expired {
-            if session.purpose == UnlockPurpose::Logs {
-                removed.push(session.key_name.clone());
-            }
+        if expired && session.purpose == UnlockPurpose::Logs {
+            removed.push(session.key_name.clone());
         }
         !expired
     });
@@ -402,11 +396,9 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    fn env_lock() -> crate::test_support::TestEnvironment {
+        crate::test_support::TestEnvironment::lock()
     }
 
     #[test]

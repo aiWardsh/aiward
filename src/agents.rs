@@ -142,11 +142,9 @@ fn key_id(public_key: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    fn env_lock() -> crate::test_support::TestEnvironment {
+        crate::test_support::TestEnvironment::lock()
     }
 
     #[test]

@@ -119,7 +119,7 @@ pub fn list_pending_worktrees() -> Result<Vec<PendingWorktree>> {
         .values()
         .flat_map(|project| project.pending.iter().cloned())
         .collect::<Vec<_>>();
-    pending.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    pending.sort_by_key(|request| std::cmp::Reverse(request.created_at));
     Ok(pending)
 }
 
@@ -323,11 +323,9 @@ pub fn evaluate_worktree(
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    fn env_lock() -> crate::test_support::TestEnvironment {
+        crate::test_support::TestEnvironment::lock()
     }
 
     fn verified(path: PathBuf) -> context::VerifiedContext {

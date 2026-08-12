@@ -531,14 +531,10 @@ fn validate_vault_path(project_path: &Path, vault: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        process::Command,
-        sync::{Mutex, OnceLock},
-    };
+    use std::process::Command;
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    fn env_lock() -> crate::test_support::TestEnvironment {
+        crate::test_support::TestEnvironment::lock()
     }
 
     fn set_home(path: &Path) {
@@ -832,8 +828,10 @@ mod tests {
             .output()
             .unwrap();
 
-        let mut registry = Registry::default();
-        registry.active_project = Some("active".to_string());
+        let mut registry = Registry {
+            active_project: Some("active".to_string()),
+            ..Registry::default()
+        };
         registry.projects.insert(
             "remote".to_string(),
             RegisteredProject {

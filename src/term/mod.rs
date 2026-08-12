@@ -556,12 +556,12 @@ pub fn render_summary_table(mode: RenderMode, table: &SummaryTable<'_>) -> Strin
     for row in table.rows {
         out.push_str(PAD);
         out.push_str("  ");
-        for idx in 0..column_count {
+        for (idx, width) in widths.iter().enumerate().take(column_count) {
             if idx > 0 {
                 out.push_str("  ");
             }
             let cell = row.get(idx).copied().unwrap_or("");
-            out.push_str(&format!("{cell:<width$}", width = widths[idx]));
+            out.push_str(&format!("{cell:<width$}", width = width));
         }
         out.push('\n');
     }

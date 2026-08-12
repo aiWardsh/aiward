@@ -148,7 +148,7 @@ pub fn list_pending_requests() -> Result<Vec<PendingRequest>> {
             requests.push(pending);
         }
     }
-    requests.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    requests.sort_by_key(|request| std::cmp::Reverse(request.created_at));
     Ok(requests)
 }
 
@@ -341,11 +341,9 @@ mod tests {
     use crate::{git_context::GitContext, policy::ApprovalMode};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    fn env_lock() -> crate::test_support::TestEnvironment {
+        crate::test_support::TestEnvironment::lock()
     }
 
     fn pending() -> PendingRequest {

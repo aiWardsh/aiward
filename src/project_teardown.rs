@@ -50,8 +50,7 @@ struct TeardownEvent<'a> {
 }
 
 pub fn teardown_project(request: ProjectTeardownRequest) -> Result<ProjectTeardownOutcome> {
-    let export_path = if request.restore_env && request.export_path == PathBuf::from(".env.export")
-    {
+    let export_path = if request.restore_env && request.export_path == Path::new(".env.export") {
         PathBuf::from(".env")
     } else {
         request.export_path

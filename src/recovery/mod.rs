@@ -7,8 +7,14 @@ use sha2::{Digest, Sha256};
 
 use crate::{fs_util, logs, vault};
 
-const RECOVERY_MEMORY_COST: u32 = 262_144; // 256 MiB — ~2s per attempt
+#[cfg(not(any(test, coverage)))]
+const RECOVERY_MEMORY_COST: u32 = 262_144; // 256 MiB, intentionally expensive per attempt.
+#[cfg(not(any(test, coverage)))]
 const RECOVERY_TIME_COST: u32 = 8;
+#[cfg(any(test, coverage))]
+const RECOVERY_MEMORY_COST: u32 = 1_024;
+#[cfg(any(test, coverage))]
+const RECOVERY_TIME_COST: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct RecoveryMaterial {
@@ -286,11 +292,9 @@ fn generate_decoy_filename() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    fn env_lock() -> crate::test_support::TestEnvironment {
+        crate::test_support::TestEnvironment::lock()
     }
 
     #[test]

@@ -94,9 +94,11 @@ pub fn run_command(request: RunCommandRequest) -> Result<RunCommandOutcome> {
     )
 }
 
+type OutputEmitter = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 pub fn run_command_with_emitter(
     request: RunCommandRequest,
-    emitter: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    emitter: OutputEmitter,
 ) -> Result<RunCommandOutcome> {
     if request.command.is_empty() {
         anyhow::bail!("no command was provided");

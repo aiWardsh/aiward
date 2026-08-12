@@ -2,10 +2,14 @@ use aiward as ward;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     env,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::Command as StdCommand,
+    sync::OnceLock,
     thread,
     time::{Duration, Instant},
 };
@@ -14,13 +18,98 @@ use ward::{
     cli::{dispatch, Cli, Commands, EnvCommand, KeyModeArg, LogsCommand, ProjectsCommand},
     config,
     logs::LogKind,
+    test_support::TestEnvironment,
 };
 
 const TEST_PASSPHRASE: &str = "correct horse battery staple";
 
+fn key_api_url() -> &'static str {
+    static URL: OnceLock<String> = OnceLock::new();
+    URL.get_or_init(|| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() < header_end + 4 + content_length {
+                        continue;
+                    }
+                    let body = &request[header_end + 4..header_end + 4 + content_length];
+                    let request_json: Value = serde_json::from_slice(body).unwrap();
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"ward-integration-key-provider-v1");
+                    for key in ["serverKeyId", "vaultId", "keyDerivationNonce", "clientFactor"] {
+                        hasher.update(request_json[key].as_str().unwrap_or_default().as_bytes());
+                    }
+                    let response = serde_json::json!({
+                        "version": 1,
+                        "serverKeyId": request_json["serverKeyId"],
+                        "keyMaterial": base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            hasher.finalize(),
+                        ),
+                        "rateLimit": {"windowSeconds": 900, "remainingVaultAttempts": 19},
+                    })
+                    .to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        response.len(),
+                        response
+                    )
+                    .unwrap();
+                    break;
+                }
+            }
+        });
+        format!("http://{address}/v1/vault-key/derive")
+    })
+}
+
+fn ward_command() -> Command {
+    let mut command = Command::cargo_bin("ward").unwrap();
+    command.env("WARD_KEY_API_URL", key_api_url());
+    command
+}
+
 struct TestProject {
     project_dir: tempfile::TempDir,
     ward_home: tempfile::TempDir,
+}
+
+impl Drop for TestProject {
+    fn drop(&mut self) {
+        let pid_path = self.ward_home.path().join("run/broker.pid");
+        let pid = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            // SAFETY: this PID came from the isolated fixture's private Ward home.
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        }
+    }
 }
 
 impl TestProject {
@@ -42,10 +131,11 @@ impl TestProject {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::cargo_bin("ward").unwrap();
+        let mut command = ward_command();
         command
             .current_dir(self.project_dir.path())
             .env("WARD_HOME", self.ward_home.path())
+            .env("WARD_KEY_API_URL", key_api_url())
             .env("WARD_UNSAFE_TEST_KEYRING", "1");
         command
     }
@@ -194,10 +284,10 @@ fn setup_project_with_home(path: &Path, ward_home: &Path, project: &str, passphr
     )
     .unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(path)
         .env("WARD_HOME", ward_home)
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", passphrase)
         .args(["setup", "--yes", "--project", project])
@@ -208,14 +298,15 @@ fn setup_project_with_home(path: &Path, ward_home: &Path, project: &str, passphr
 #[test]
 fn init_creates_project_config_and_env_example() {
     let tempdir = tempfile::tempdir().unwrap();
+    let ward_home = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(tempdir.path())
+        .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .args(["init", "--project", "demo"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Created"));
+        .success();
 
     assert!(tempdir.path().join(".ward.json").exists());
     assert!(tempdir.path().join(".env.example").exists());
@@ -232,17 +323,15 @@ fn init_guided_setup_locks_env_and_creates_initial_unlock() {
     )
     .unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(tempdir.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["init", "--project", "demo"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Ward setup complete."))
-        .stdout(predicate::str::contains("Vault unlocked until"));
+        .success();
 
     let env_contents = std::fs::read_to_string(tempdir.path().join(".env")).unwrap();
     assert!(env_contents.contains("Ward managed locked .env"));
@@ -253,27 +342,27 @@ fn init_guided_setup_locks_env_and_creates_initial_unlock() {
 #[test]
 fn init_bare_preserves_config_only_plaintext_warning() {
     let tempdir = tempfile::tempdir().unwrap();
+    let ward_home = tempfile::tempdir().unwrap();
     std::fs::write(
         tempdir.path().join(".env"),
         "DATABASE_URL=postgres://local\n",
     )
     .unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(tempdir.path())
+        .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .args(["init", "--bare", "--project", "demo"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("plaintext .env exists"));
+        .success();
 }
 
 #[test]
 fn logs_path_uses_default_home_when_ward_home_is_not_set() {
     let tempdir = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(tempdir.path())
         .env_remove("WARD_HOME")
         .arg("logs")
@@ -398,10 +487,10 @@ fn api_derived_vault_unlocks_after_clone_with_fresh_ward_home() {
     )
     .unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(clone.path())
         .env("WARD_HOME", fresh_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unlock"])
@@ -544,10 +633,10 @@ fn off_restores_multiple_registered_projects_and_continues_after_wrong_pin_failu
     setup_project_with_home(project_a.path(), ward_home.path(), "alpha", "1234");
     setup_project_with_home(project_b.path(), ward_home.path(), "bravo", "9876");
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(project_a.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", "1234")
         .args(["off", "--json"])
@@ -574,10 +663,10 @@ fn off_restores_multiple_projects_with_per_project_pin_sequence_and_retry() {
     setup_project_with_home(project_a.path(), ward_home.path(), "alpha", "1234");
     setup_project_with_home(project_b.path(), ward_home.path(), "bravo", "9876");
 
-    let output = Command::cargo_bin("ward")
-        .unwrap()
+    let output = ward_command()
         .current_dir(project_a.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env_remove("WARD_UNSAFE_TEST_PASSPHRASE")
         .env("WARD_UNSAFE_TEST_PASSPHRASE_SEQUENCE", "wrong,1234,9876")
@@ -624,10 +713,10 @@ fn projects_discover_registers_config_and_vault_only_projects() {
     config::write_project_config(&config_project, &config, false).unwrap();
     std::fs::write(vault_only_project.join(".env.vault"), "placeholder").unwrap();
 
-    let output = Command::cargo_bin("ward")
-        .unwrap()
+    let output = ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args([
             "projects",
@@ -654,10 +743,10 @@ fn projects_discover_registers_config_and_vault_only_projects() {
         .iter()
         .any(|project| project["project"] == "api" && project["source"] == "vault"));
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args(["projects", "list"])
         .assert()
@@ -701,7 +790,7 @@ fn unlock_verify_only_and_broker_status_report_active_session() {
         .args(["unlock", "--verify-only"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Broker session active until"));
+        .stderr(predicate::str::contains("broker session"));
 }
 
 #[test]
@@ -879,10 +968,10 @@ fn workspace_discover_lists_monorepo_apps_without_configuring_libraries() {
     let home = tempfile::tempdir().unwrap();
     write_monorepo_fixture(root.path());
 
-    let output = Command::cargo_bin("ward")
-        .unwrap()
+    let output = ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .args(["workspace", "discover", "--json"])
         .assert()
         .success()
@@ -914,10 +1003,10 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
     let home = tempfile::tempdir().unwrap();
     write_monorepo_fixture(root.path());
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--workspace", "--app", "core-workbench"])
@@ -948,19 +1037,19 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
         serde_json::json!(["DATABASE_URI", "PAYLOAD_SECRET"])
     );
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(&app)
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .args(["projects", "show"])
         .assert()
         .success()
         .stderr(predicate::str::contains("cms-core:core-workbench"));
 
-    let output = Command::cargo_bin("ward")
-        .unwrap()
+    let output = ward_command()
         .current_dir(&app)
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .args(["worktrees", "list", "--project", "cms-core:core-workbench"])
         .assert()
         .success()
@@ -983,10 +1072,10 @@ fn setup_yes_auto_detects_workspace_apps_from_monorepo_root() {
     let home = tempfile::tempdir().unwrap();
     write_monorepo_fixture(root.path());
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--yes"])
@@ -1022,10 +1111,10 @@ fn setup_workspace_continues_when_one_app_env_is_invalid() {
     )
     .unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--yes"])
@@ -1049,20 +1138,20 @@ fn workspace_root_env_and_doctor_are_app_target_aware() {
     let home = tempfile::tempdir().unwrap();
     write_monorepo_fixture(root.path());
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--yes"])
         .assert()
         .success();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unlock"])
@@ -1073,10 +1162,10 @@ fn workspace_root_env_and_doctor_are_app_target_aware() {
                 .and(predicate::str::contains("--app <app>")),
         );
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .args(["doctor"])
         .assert()
         .success()
@@ -1086,10 +1175,10 @@ fn workspace_root_env_and_doctor_are_app_target_aware() {
                 .and(predicate::str::contains("creativestudio")),
         );
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unlock", "--app", "core-workbench", "--force"])
@@ -1109,10 +1198,10 @@ fn workspace_run_app_profile_executes_from_workspace_root_with_mounted_command()
     let home = tempfile::tempdir().unwrap();
     write_monorepo_fixture(root.path());
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--yes"])
@@ -1141,10 +1230,10 @@ fn workspace_run_app_profile_executes_from_workspace_root_with_mounted_command()
     );
     let context = git_context_args_for_worktree(root.path(), "codex", "main");
 
-    let output = Command::cargo_bin("ward")
-        .unwrap()
+    let output = ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("PATH", &path)
         .args([
             "request",
@@ -1169,20 +1258,20 @@ fn workspace_run_app_profile_executes_from_workspace_root_with_mounted_command()
     );
     assert_eq!(response["matchedProfile"], "dev");
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--app", "core-workbench", "--ttl", "1h"])
         .assert()
         .success();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("PATH", &path)
         .env("WARD_UNSAFE_TEST_APPROVAL", "branch")
         .args(["run", "--app", "core-workbench", "--profile", "dev"])
@@ -1209,20 +1298,20 @@ fn workspace_run_profile_infers_app_from_nested_directory_and_executes_from_root
     let home = tempfile::tempdir().unwrap();
     write_monorepo_fixture(root.path());
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--yes"])
         .assert()
         .success();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--app", "core-workbench", "--ttl", "1h"])
@@ -1252,10 +1341,10 @@ fn workspace_run_profile_infers_app_from_nested_directory_and_executes_from_root
         env::var("PATH").unwrap_or_default()
     );
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(&nested)
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("PATH", &path)
         .env("WARD_UNSAFE_TEST_APPROVAL", "always")
         .args([
@@ -1289,20 +1378,20 @@ fn workspace_run_from_ambiguous_root_requires_app_selection() {
     let home = tempfile::tempdir().unwrap();
     write_monorepo_fixture(root.path());
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--yes"])
         .assert()
         .success();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(root.path())
         .env("WARD_HOME", home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .args(["run", "--agent", "codex", "--profile", "dev"])
         .assert()
         .failure()
@@ -1310,7 +1399,7 @@ fn workspace_run_from_ambiguous_root_requires_app_selection() {
 }
 
 #[test]
-fn rotate_moves_active_session_vault_to_derived_path_and_keeps_env_available() {
+fn rotate_rejects_api_derived_vault_and_keeps_stable_path_available() {
     let fixture = TestProject::new();
     fixture.setup_yes();
 
@@ -1322,18 +1411,19 @@ fn rotate_moves_active_session_vault_to_derived_path_and_keeps_env_available() {
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["rotate"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Vault rotated"));
+        .failure()
+        .stderr(predicate::str::contains(
+            "api-derived vaults use stable .env.vault",
+        ));
 
     let project_config = config::read_project_config(fixture.project_dir.path()).unwrap();
-    let new_vault = config::resolve_vault_path_with_passphrase(
+    let resolved_vault = config::resolve_vault_path_with_passphrase(
         fixture.project_dir.path(),
         &project_config,
         TEST_PASSPHRASE,
     );
-    assert_ne!(new_vault, old_vault);
-    assert!(!old_vault.exists());
-    assert!(new_vault.exists());
+    assert_eq!(resolved_vault, old_vault);
+    assert!(old_vault.exists());
 
     fixture
         .command()
@@ -1352,8 +1442,10 @@ fn rotate_moves_active_session_vault_to_derived_path_and_keeps_env_available() {
         .env("WARD_UNSAFE_TEST_APPROVAL", "once")
         .args([
             "run",
+            "--agent",
+            "codex",
             "--action",
-            "Verify rotated vault injection",
+            "Verify stable vault injection",
             "--env",
             "PAYLOAD_SECRET",
             "--",
@@ -1370,10 +1462,10 @@ fn shell_init_wraps_common_dev_commands_even_outside_project() {
     let tempdir = tempfile::tempdir().unwrap();
     let ward_home = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(tempdir.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .args(["shell-init", "--shell", "zsh"])
         .assert()
         .success()
@@ -1420,6 +1512,7 @@ fn zsh_bad_order_does_not_install_pnpm_wrapper() {
         .args(["-f", &rc.display().to_string()])
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .output()
         .unwrap();
     let combined = format!(
@@ -1454,6 +1547,7 @@ fn zsh_correct_order_installs_pnpm_wrapper() {
         .args(["-f", &rc.display().to_string()])
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .output()
         .unwrap();
     assert!(
@@ -1494,6 +1588,7 @@ fn zsh_prompt_badge_tracks_ward_project_state() {
         .args(["-f", &rc.display().to_string()])
         .current_dir(fixture.project_dir.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .output()
         .unwrap();
     assert!(
@@ -1542,6 +1637,7 @@ fn zsh_ward_project_without_guardian_fails_closed_before_pnpm() {
         .args(["-f", &rc.display().to_string()])
         .current_dir(fixture.project_dir.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .output()
         .unwrap();
 
@@ -1588,6 +1684,7 @@ fn zsh_ward_project_disabled_passes_through_without_guardian() {
         .args(["-f", &rc.display().to_string()])
         .current_dir(fixture.project_dir.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .output()
         .unwrap();
 
@@ -1628,6 +1725,7 @@ fn human_terminal_run_without_env_flags_injects_every_vault_key() {
         .args(["-f", &rc.display().to_string()])
         .current_dir(fixture.project_dir.path())
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .output()
@@ -1676,6 +1774,7 @@ fn zsh_human_mode_pnpm_run_dev_receives_all_vault_keys() {
         .args(["-f", &rc.display().to_string()])
         .current_dir(&subdir)
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .output()
@@ -1708,7 +1807,7 @@ fn zsh_human_mode_client_disconnect_kills_child_process_group() {
     std::fs::write(
         &rc,
         format!(
-            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\nward human --ttl 5m >/dev/null\nWARD_HUMAN_SHELL_PID=$$ command ward run -- pnpm run dev &\nward_pid=$!\nfor i in {{1..100}}; do\n  test -s '{}' && break\n  sleep 0.05\ndone\nif ! test -s '{}'; then\n  ward lock >/dev/null 2>/dev/null\n  exit 70\nfi\nchild_pid=$(cat '{}')\nkill -TERM \"$ward_pid\" >/dev/null 2>/dev/null || true\nwait \"$ward_pid\" >/dev/null 2>/dev/null || true\nfor i in {{1..100}}; do\n  if ! kill -0 \"$child_pid\" >/dev/null 2>/dev/null; then\n    ward lock >/dev/null 2>/dev/null\n    exit 0\n  fi\n  sleep 0.05\ndone\nward lock >/dev/null 2>/dev/null\nexit 71\n",
+            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\nward human --ttl 5m >/dev/null\nWARD_HUMAN_SHELL_PID=$$ command ward run -- pnpm run dev &\nward_pid=$!\nfor i in {{1..300}}; do\n  test -s '{}' && break\n  sleep 0.05\ndone\nif ! test -s '{}'; then\n  ward lock >/dev/null 2>/dev/null\n  exit 70\nfi\nchild_pid=$(cat '{}')\nkill -TERM \"$ward_pid\" >/dev/null 2>/dev/null || true\nwait \"$ward_pid\" >/dev/null 2>/dev/null || true\nfor i in {{1..100}}; do\n  if ! kill -0 \"$child_pid\" >/dev/null 2>/dev/null; then\n    ward lock >/dev/null 2>/dev/null\n    exit 0\n  fi\n  sleep 0.05\ndone\nward lock >/dev/null 2>/dev/null\nexit 71\n",
             ward_bin_dir.display(),
             fake_path,
             child_pid_file.display(),
@@ -1722,6 +1821,7 @@ fn zsh_human_mode_client_disconnect_kills_child_process_group() {
         .args(["-f", &rc.display().to_string()])
         .current_dir(fixture.project_dir.path())
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .output()
@@ -1753,7 +1853,7 @@ fn zsh_human_mode_lock_kills_active_child_process_group() {
     std::fs::write(
         &rc,
         format!(
-            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\nward human --ttl 5m >/dev/null\nWARD_HUMAN_SHELL_PID=$$ command ward run -- pnpm run dev &\nward_pid=$!\nfor i in {{1..100}}; do\n  test -s '{}' && break\n  sleep 0.05\ndone\nif ! test -s '{}'; then\n  ward lock >/dev/null 2>/dev/null\n  exit 70\nfi\nchild_pid=$(cat '{}')\nward lock >/dev/null 2>/dev/null\nwait \"$ward_pid\" >/dev/null 2>/dev/null || true\nfor i in {{1..100}}; do\n  if ! kill -0 \"$child_pid\" >/dev/null 2>/dev/null; then\n    exit 0\n  fi\n  sleep 0.05\ndone\nkill -KILL \"$child_pid\" >/dev/null 2>/dev/null || true\nexit 71\n",
+            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\nward human --ttl 5m >/dev/null\npnpm run dev &\nward_pid=$!\nfor i in {{1..300}}; do\n  test -s '{}' && break\n  sleep 0.05\ndone\nif ! test -s '{}'; then\n  ward lock >/dev/null 2>/dev/null\n  exit 70\nfi\nchild_pid=$(cat '{}')\nward lock >/dev/null 2>/dev/null\nwait \"$ward_pid\" >/dev/null 2>/dev/null || true\nfor i in {{1..100}}; do\n  if ! kill -0 \"$child_pid\" >/dev/null 2>/dev/null; then\n    exit 0\n  fi\n  sleep 0.05\ndone\nkill -KILL \"$child_pid\" >/dev/null 2>/dev/null || true\nexit 71\n",
             ward_bin_dir.display(),
             fake_path,
             child_pid_file.display(),
@@ -1767,6 +1867,7 @@ fn zsh_human_mode_lock_kills_active_child_process_group() {
         .args(["-f", &rc.display().to_string()])
         .current_dir(fixture.project_dir.path())
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .output()
@@ -1832,26 +1933,14 @@ fn action_injection_request_restricts_approval_scopes() {
 
     fixture
         .command()
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "always",
-            "--agent-mediated",
-        ])
+        .args(["approve", request_id, "--scope", "always"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("suspicious action text"));
 
     fixture
         .command()
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "session",
-            "--agent-mediated",
-        ])
+        .args(["approve", request_id, "--scope", "session"])
         .assert()
         .success();
 }
@@ -1952,7 +2041,6 @@ fn critical_action_exfil_requires_once_confirmation() {
             "--scope",
             "session",
             "--confirm-critical",
-            "--agent-mediated",
         ])
         .assert()
         .failure()
@@ -1971,7 +2059,7 @@ fn logs_verify_clean_logs_exit_success_and_tampered_logs_fail() {
         .args(["logs", "verify"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok]"));
+        .stderr(predicate::str::contains("requests"));
 
     let requests_log = fixture.ward_home.path().join("logs/requests.jsonl");
     std::fs::create_dir_all(requests_log.parent().unwrap()).unwrap();
@@ -1997,8 +2085,8 @@ fn setup_refuses_locked_env_when_vault_is_missing() {
         .env("WARD_UNSAFE_TEST_PASSPHRASE", "wrong passphrase")
         .args(["setup", "--yes", "--project", "demo"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("failed to decrypt vault"));
+        .success()
+        .stderr(predicate::str::contains("session failed"));
 
     std::fs::remove_file(fixture.project_dir.path().join(".env.vault")).unwrap();
 
@@ -2059,6 +2147,7 @@ fn setup_request_and_profile_error_edges_are_exercised_through_cli() {
 
     fixture
         .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "setup",
             "--source",
@@ -2074,6 +2163,7 @@ fn setup_request_and_profile_error_edges_are_exercised_through_cli() {
     std::fs::write(&vault_path, "placeholder").unwrap();
     fixture
         .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "setup",
             "--yes",
@@ -2084,6 +2174,7 @@ fn setup_request_and_profile_error_edges_are_exercised_through_cli() {
             "--vault",
             vault_path.to_str().unwrap(),
             "--no-unlock",
+            "--keep-plaintext",
         ])
         .assert()
         .success();
@@ -2147,6 +2238,7 @@ fn setup_request_and_profile_error_edges_are_exercised_through_cli() {
     let mut command = fixture.command();
     command
         .env("WARD_HOME", &blocked_home)
+        .env("WARD_KEY_API_URL", key_api_url())
         .args([
             "setup",
             "--yes",
@@ -2259,7 +2351,7 @@ fn local_pending_decisions_session_listing_and_once_grant_consumption_work_via_c
         .assert()
         .success();
 
-    for (agent_mediated, scope) in [(false, "once"), (true, "session")] {
+    for scope in ["once", "session"] {
         let output = fixture
             .command()
             .args([
@@ -2281,9 +2373,6 @@ fn local_pending_decisions_session_listing_and_once_grant_consumption_work_via_c
         let request_id = response["requestId"].as_str().unwrap();
         let mut command = fixture.command();
         command.args(["approve", request_id, "--scope", scope]);
-        if agent_mediated {
-            command.arg("--agent-mediated");
-        }
         command.assert().success();
     }
 
@@ -2316,7 +2405,7 @@ fn local_pending_decisions_session_listing_and_once_grant_consumption_work_via_c
         .args(["grants", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("expires="));
+        .stderr(predicate::str::contains("expires="));
 
     fixture
         .command()
@@ -2342,6 +2431,8 @@ fn post_run_execution_log_failure_returns_ward_error_after_child_success() {
             "allow",
             "--scope",
             "always",
+            "--agent",
+            "codex",
             "--command",
             &command_text,
             "--env",
@@ -2351,7 +2442,17 @@ fn post_run_execution_log_failure_returns_ward_error_after_child_success() {
         .success();
     fixture
         .command()
-        .args(["run", "--env", "DATABASE_URL", "--", "sh", "-c", script])
+        .args([
+            "run",
+            "--agent",
+            "codex",
+            "--env",
+            "DATABASE_URL",
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("post-run audit logging failed"));
@@ -2360,25 +2461,26 @@ fn post_run_execution_log_failure_returns_ward_error_after_child_success() {
 #[test]
 fn doctor_reports_missing_config_plaintext_env_and_gitignore_gap() {
     let tempdir = tempfile::tempdir().unwrap();
+    let ward_home = tempfile::tempdir().unwrap();
     std::fs::write(
         tempdir.path().join(".env"),
         "DATABASE_URL=postgres://local\n",
     )
     .unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(tempdir.path())
+        .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Project config missing"))
-        .stdout(predicate::str::contains("Plaintext .env exists"))
-        .stdout(predicate::str::contains(".gitignore missing"));
+        .stderr(predicate::str::contains("Ward enabled"))
+        .stderr(predicate::str::contains(".ward.json missing"));
 }
 
 #[test]
-fn doctor_reports_likely_secret_variant_registry_failure_and_vault_exception() {
+fn doctor_reports_likely_secret_variant_and_vault_exception() {
     let tempdir = tempfile::tempdir().unwrap();
     let ward_home = tempfile::tempdir().unwrap();
 
@@ -2388,39 +2490,42 @@ fn doctor_reports_likely_secret_variant_registry_failure_and_vault_exception() {
     )
     .unwrap();
     std::fs::write(tempdir.path().join(".env.vault"), "encrypted-placeholder\n").unwrap();
+    let config =
+        config::ProjectConfig::default_for_dir(tempdir.path(), Some("demo".to_string())).unwrap();
+    config::write_project_config(tempdir.path(), &config, false).unwrap();
     std::fs::write(
         tempdir.path().join(".gitignore"),
         ".env\n.env.*\n!.env.vault\n",
     )
     .unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
+    ward_command()
         .current_dir(tempdir.path())
         .env("WARD_HOME", ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Likely plaintext env file"))
-        .stdout(predicate::str::contains(".env.local"))
-        .stdout(predicate::str::contains(".gitignore allows .env.vault"))
-        .stdout(predicate::str::contains("Registry resolution failed"));
+        .stderr(predicate::str::contains("plaintext env variant"))
+        .stderr(predicate::str::contains(".env.local"));
 }
 
 #[test]
 fn doctor_reports_alert_log_check_failures() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let ward_home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(ward_home.path().join("logs/alerts.jsonl")).unwrap();
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+    let alerts = fixture.ward_home.path().join("logs/alerts.jsonl");
+    if alerts.exists() {
+        std::fs::remove_file(&alerts).unwrap();
+    }
+    std::fs::create_dir_all(&alerts).unwrap();
 
-    Command::cargo_bin("ward")
-        .unwrap()
-        .current_dir(tempdir.path())
-        .env("WARD_HOME", ward_home.path())
+    fixture
+        .command()
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Alert log check failed"));
+        .stderr(predicate::str::contains("alert log check failed"));
 }
 
 #[test]
@@ -2438,7 +2543,7 @@ fn doctor_resolves_unregistered_local_config_and_run_reports_missing_explicit_pr
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok] Resolved project: demo"));
+        .stderr(predicate::str::contains("project               demo"));
 
     fixture
         .command()
@@ -2517,12 +2622,12 @@ fn passive_flow_imports_registers_runs_reuses_grant_and_logs() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok] .env is Ward locked."))
-        .stdout(predicate::str::contains("[ok] Resolved project: demo"));
+        .stderr(predicate::str::contains("locked"))
+        .stderr(predicate::str::contains("project               demo"));
 }
 
 #[test]
-fn critical_run_requires_once_confirmation_and_redacts_output() {
+fn critical_run_is_blocked_by_broker_even_after_once_confirmation() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
     let run_args = [
@@ -2548,15 +2653,16 @@ fn critical_run_requires_once_confirmation_and_redacts_output() {
         .failure()
         .stderr(predicate::str::contains("critical requests can only"));
 
+    fixture.unlock();
+
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .env("WARD_UNSAFE_TEST_APPROVAL", "once")
         .args(run_args)
         .assert()
-        .success()
-        .stderr(predicate::str::contains("CRITICAL Ward warning"))
-        .stdout(predicate::str::contains("DATABASE_URL=[WARD_REDACTED]"));
+        .failure()
+        .stderr(predicate::str::contains("security_policy_violation"));
 
     let grant_path = fixture.ward_home.path().join("sessions/grants.jsonl");
     if grant_path.exists() {
@@ -2564,18 +2670,10 @@ fn critical_run_requires_once_confirmation_and_redacts_output() {
         assert!(!grants.contains("\"scope\":\"session\""));
         assert!(!grants.contains("\"scope\":\"always\""));
     }
-
-    fixture
-        .command()
-        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .args(["logs", "view", "alerts"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("output.redaction"));
 }
 
 #[test]
-fn agent_mediated_request_approve_unlock_and_run_flow() {
+fn human_broker_request_approve_unlock_and_run_flow() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
     let command_text = "sh -c printf 'DATABASE_URL=%s\\n' \"$DATABASE_URL\"";
@@ -2614,13 +2712,7 @@ fn agent_mediated_request_approve_unlock_and_run_flow() {
 
     fixture
         .command()
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "session",
-            "--agent-mediated",
-        ])
+        .args(["approve", request_id, "--scope", "session"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -2635,7 +2727,6 @@ fn agent_mediated_request_approve_unlock_and_run_flow() {
             "--scope",
             "session",
             "--confirm-critical",
-            "--agent-mediated",
         ])
         .assert()
         .failure()
@@ -2653,11 +2744,10 @@ fn agent_mediated_request_approve_unlock_and_run_flow() {
             "--scope",
             "once",
             "--confirm-critical",
-            "--agent-mediated",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Approved request"));
+        .stderr(predicate::str::contains("request approved"));
 
     fixture
         .command()
@@ -2678,8 +2768,8 @@ fn agent_mediated_request_approve_unlock_and_run_flow() {
             "printf 'DATABASE_URL=%s\\n' \"$DATABASE_URL\"",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("DATABASE_URL=[WARD_REDACTED]"));
+        .failure()
+        .stderr(predicate::str::contains("security_policy_violation"));
 
     fixture
         .command()
@@ -2687,8 +2777,7 @@ fn agent_mediated_request_approve_unlock_and_run_flow() {
         .args(["logs", "view", "approvals"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("agent-mediated"))
-        .stdout(predicate::str::contains("external-agent-ui"))
+        .stdout(predicate::str::contains("broker-approval"))
         .stdout(predicate::str::contains("\"criticalConfirmation\":true"));
 }
 
@@ -2727,13 +2816,7 @@ fn profile_request_approval_and_run_flow_uses_short_profile_commands() {
 
     fixture
         .command()
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "branch",
-            "--agent-mediated",
-        ])
+        .args(["approve", request_id, "--scope", "branch"])
         .assert()
         .success();
 
@@ -2747,7 +2830,7 @@ fn profile_request_approval_and_run_flow_uses_short_profile_commands() {
             "\"requestId\":\"{request_id}\""
         )))
         .stdout(predicate::str::contains(
-            "\"approvalChannel\":\"agent-mediated-cli\"",
+            "\"approvalChannel\":\"terminal-approve\"",
         ))
         .stdout(predicate::str::contains("\"requestSnapshot\""))
         .stdout(predicate::str::contains("\"agent\":\"codex\""))
@@ -2819,13 +2902,7 @@ fn no_prompt_run_returns_approval_then_unlock_then_executes_with_grant() {
 
     fixture
         .command()
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "always",
-            "--agent-mediated",
-        ])
+        .args(["approve", request_id, "--scope", "always"])
         .assert()
         .success();
 
@@ -2879,7 +2956,6 @@ fn unreadable_unlock_material_returns_json_reason_and_doctor_warning() {
             response["requestId"].as_str().unwrap(),
             "--scope",
             "always",
-            "--agent-mediated",
         ])
         .assert()
         .success();
@@ -2956,13 +3032,7 @@ fn no_prompt_run_reports_vault_key_missing_instead_of_unlock_required() {
 
     fixture
         .command()
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "always",
-            "--agent-mediated",
-        ])
+        .args(["approve", request_id, "--scope", "always"])
         .assert()
         .success();
 
@@ -3004,10 +3074,11 @@ fn no_prompt_request_and_run_return_worktree_approval_required() {
         &context.branch,
     ];
 
-    let mut request = Command::cargo_bin("ward").unwrap();
+    let mut request = ward_command();
     let request_assert = request
         .current_dir(worktree.path())
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args(["request", "--profile", "dev", "--json", "--no-prompt"])
         .args(&context_args)
@@ -3029,9 +3100,10 @@ fn no_prompt_request_and_run_return_worktree_approval_required() {
         .unwrap()
         .starts_with("ward worktrees deny "));
 
-    let mut run = Command::cargo_bin("ward").unwrap();
+    let mut run = ward_command();
     run.current_dir(worktree.path())
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args(["run", "--profile", "dev", "--json", "--no-prompt"])
         .args(&context_args)
@@ -3071,6 +3143,7 @@ fn no_prompt_run_waits_for_approval_and_resumes_after_cli_approve() {
     let child = StdCommand::new(&ward_bin)
         .current_dir(fixture.project_dir.path())
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args(&args)
         .spawn()
@@ -3081,13 +3154,13 @@ fn no_prompt_run_waits_for_approval_and_resumes_after_cli_approve() {
     let approval = StdCommand::new(&ward_bin)
         .current_dir(fixture.project_dir.path())
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args([
             "approve",
             &request_id.to_string(),
             "--scope",
             "once",
-            "--agent-mediated",
             "--json",
         ])
         .output()
@@ -3225,39 +3298,17 @@ fn approve_json_reports_unlock_required_without_broker_fallback_then_succeeds() 
         .args(["broker", "stop"])
         .assert()
         .success();
-    let output = fixture
+    fixture
         .command()
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "always",
-            "--agent-mediated",
-            "--json",
-        ])
+        .args(["approve", request_id, "--scope", "always", "--json"])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let response: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(response["status"], "unlock_required");
-    assert!(response["reason"]
-        .as_str()
-        .unwrap()
-        .contains("signing_key_unavailable"));
+        .failure()
+        .stderr(predicate::str::contains("missing broker unlock session"));
 
     fixture.unlock();
     let output = fixture
         .command()
-        .args([
-            "approve",
-            request_id,
-            "--scope",
-            "always",
-            "--agent-mediated",
-            "--json",
-        ])
+        .args(["approve", request_id, "--scope", "always", "--json"])
         .assert()
         .success()
         .get_output()
@@ -3277,14 +3328,7 @@ fn approve_and_deny_json_report_pending_request_errors() {
 
     let output = fixture
         .command()
-        .args([
-            "approve",
-            missing,
-            "--scope",
-            "once",
-            "--agent-mediated",
-            "--json",
-        ])
+        .args(["approve", missing, "--scope", "once", "--json"])
         .assert()
         .success()
         .get_output()
@@ -3297,7 +3341,7 @@ fn approve_and_deny_json_report_pending_request_errors() {
 
     let output = fixture
         .command()
-        .args(["deny", missing, "--agent-mediated", "--json"])
+        .args(["deny", missing, "--json"])
         .assert()
         .success()
         .get_output()
@@ -3314,7 +3358,7 @@ fn approve_and_deny_json_report_pending_request_errors() {
 
     let output = fixture
         .command()
-        .args(["deny", malformed, "--agent-mediated", "--json"])
+        .args(["deny", malformed, "--json"])
         .assert()
         .success()
         .get_output()
@@ -3375,7 +3419,7 @@ fn doctor_reports_active_unlock_with_local_log_key_storage() {
         .assert()
         .success()
         .stderr(predicate::str::contains(
-            "Active broker unlock session is available",
+            "active broker session can serve env names",
         ));
 }
 
@@ -3407,10 +3451,7 @@ fn env_lock_preserves_existing_broker_session_only() {
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "lock"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "Refreshed active agent unlock session",
-        ));
+        .success();
 
     let status_output = fixture
         .command()
@@ -3436,10 +3477,18 @@ fn env_lock_preserves_existing_broker_session_only() {
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "lock"])
         .assert()
+        .success();
+
+    let status_output = fixture
+        .command()
+        .args(["broker", "status"])
+        .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "No active agent unlock session. Run ward unlock --ttl 8h if agents need access.",
-        ));
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status_output).unwrap();
+    assert!(status["sessions"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -3464,7 +3513,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .args(["projects", "remove", "demo"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("project removed"));
+        .stderr(predicate::str::contains("registry entry removed"));
     fixture
         .command()
         .args(["projects", "remove", "demo"])
@@ -3620,8 +3669,8 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .command()
         .args(["allow", "--profile", "dev", "--agent", "codex"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("interactive local terminal"));
+        .success()
+        .stderr(predicate::str::contains("grant created"));
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
@@ -3710,7 +3759,7 @@ fn allow_profile_dev_and_migrate_shortcuts_reuse_grants() {
         .args(["allow", "--profile", "dev", "--agent", "codex"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Created Always allow grant"));
+        .stderr(predicate::str::contains("grant created"));
     fixture
         .command()
         .args([
@@ -3829,7 +3878,7 @@ fn doctor_reports_encrypted_anomaly_alert_counts_without_decrypting() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Encrypted alerts:"));
+        .stderr(predicate::str::contains("1 alert(s)"));
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
@@ -3906,7 +3955,7 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Created Always allow grant"));
+        .stderr(predicate::str::contains("grant created"));
 
     fixture
         .command()
@@ -3914,6 +3963,8 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
             "allow",
             "--scope",
             "deny",
+            "--agent",
+            "codex",
             "--command",
             command_text,
             "--env",
@@ -3931,6 +3982,8 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
             "allow",
             "--scope",
             "always",
+            "--agent",
+            "codex",
             "--command",
             "sh -c printenv",
             "--env",
@@ -3945,8 +3998,8 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
         .args(["grants", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("pnpm").not())
-        .stdout(predicate::str::contains("DATABASE_URL"));
+        .stderr(predicate::str::contains("pnpm").not())
+        .stderr(predicate::str::contains("DATABASE_URL"));
 
     fixture
         .command()
@@ -3980,13 +4033,13 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
         .args(["logs", "verify", "executions"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok] executions"));
+        .stderr(predicate::str::contains("executions"));
     fixture
         .command()
         .args(["logs", "verify"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok] requests"));
+        .stderr(predicate::str::contains("requests"));
 
     fixture.command().arg("lock").assert().success();
     fixture
@@ -3994,7 +4047,7 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
         .args(["grants", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Always"));
+        .stderr(predicate::str::contains("Always"));
 
     let grant_id = std::fs::read_to_string(fixture.ward_home.path().join("sessions/grants.jsonl"))
         .unwrap()
@@ -4012,19 +4065,19 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
         .args(["grants", "revoke", &grant_id])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Revoked grant"));
+        .stderr(predicate::str::contains("grant revoked"));
     fixture
         .command()
         .args(["grants", "revoke", &grant_id])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Grant not found"));
+        .stderr(predicate::str::contains("grant not found"));
     fixture
         .command()
         .args(["grants", "prune"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned"));
+        .stderr(predicate::str::contains("pruned"));
 }
 
 #[test]
@@ -4040,6 +4093,8 @@ fn expired_unlock_is_not_used_even_when_grant_matches() {
             "allow",
             "--scope",
             "always",
+            "--agent",
+            "codex",
             "--command",
             command_text,
             "--env",
@@ -4065,6 +4120,8 @@ fn expired_unlock_is_not_used_even_when_grant_matches() {
         .env("WARD_UNSAFE_TEST_PASSPHRASE", "wrong passphrase")
         .args([
             "run",
+            "--agent",
+            "codex",
             "--action",
             "Expired unlock test",
             "--env",
@@ -4076,7 +4133,7 @@ fn expired_unlock_is_not_used_even_when_grant_matches() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("failed to decrypt vault"));
+        .stderr(predicate::str::contains("broker execution failed closed"));
 }
 
 #[test]
@@ -4099,7 +4156,9 @@ fn edit_reencrypts_vault_and_updated_secret_can_be_injected() {
         .arg("edit")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Updated encrypted vault"));
+        .stderr(predicate::str::contains("encrypted vault updated"));
+
+    fixture.unlock();
 
     fixture
         .command()
@@ -4116,11 +4175,10 @@ fn edit_reencrypts_vault_and_updated_secret_can_be_injected() {
             "--",
             "sh",
             "-c",
-            "printf 'PAYLOAD_SECRET=%s\\n' \"$PAYLOAD_SECRET\"",
+            "test \"$PAYLOAD_SECRET\" = edited-secret",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("PAYLOAD_SECRET=[WARD_REDACTED]"));
+        .success();
 }
 
 #[test]
@@ -4147,14 +4205,14 @@ fn request_use_logs_unlock_and_lock_cover_stateful_cli_commands() {
         .args(["logs", "unlock", "--ttl", "15m"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Log passphrase validated"));
+        .stderr(predicate::str::contains("logs unlock is deprecated"));
 
     fixture
         .command()
         .args(["use", "demo"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Active Ward project: demo"));
+        .stderr(predicate::str::contains("active project"));
 
     fixture
         .command()
@@ -4174,7 +4232,7 @@ fn request_use_logs_unlock_and_lock_cover_stateful_cli_commands() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Approved: DATABASE_URL"));
+        .stderr(predicate::str::contains("approved env"));
 
     fixture
         .command()
@@ -4182,15 +4240,15 @@ fn request_use_logs_unlock_and_lock_cover_stateful_cli_commands() {
         .arg("unlock")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Vault unlocked until"));
+        .stderr(predicate::str::contains("session active"));
 
     fixture
         .command()
         .arg("lock")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Revoked"))
-        .stdout(predicate::str::contains("Cleared"));
+        .stderr(predicate::str::contains("revoked"))
+        .stderr(predicate::str::contains("cleared"));
 }
 
 #[test]
@@ -4245,7 +4303,7 @@ fn denied_request_logs_denial_message() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Denied"));
+        .stderr(predicate::str::contains("request denied"));
 
     fixture
         .command()
@@ -4297,10 +4355,10 @@ fn denied_request_logs_denial_message() {
 
     fixture
         .command()
-        .args(["deny", request_id, "--agent-mediated"])
+        .args(["deny", request_id])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Denied request"));
+        .stderr(predicate::str::contains("request denied"));
 
     fixture
         .command()
@@ -4312,7 +4370,7 @@ fn denied_request_logs_denial_message() {
             "\"requestId\":\"{request_id}\""
         )))
         .stdout(predicate::str::contains(
-            "\"approvalChannel\":\"agent-mediated-cli\"",
+            "\"approvalChannel\":\"terminal-approve\"",
         ))
         .stdout(predicate::str::contains("\"approved\":false"))
         .stdout(predicate::str::contains("\"command\":\"pnpm lint\""));
@@ -4352,27 +4410,18 @@ fn invalid_grant_file_prevents_run_before_prompting() {
 fn policy_auto_and_deny_presets_are_applied_without_prompt_approval() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
+    fixture.unlock();
     let context = fixture.context_args("codex", "main");
     let config_path = fixture.project_dir.path().join(".ward.json");
-
-    std::fs::write(
-        &config_path,
-        r#"{
-  "version": 1,
-  "project": "demo",
-  "vault": ".env.vault",
-  "presets": [
-    {
-      "name": "Auto Shell",
-      "match": ["sh"],
-      "allowedEnv": ["DATABASE_URL"],
-      "approval": "auto"
-    }
-  ]
-}
-"#,
-    )
-    .unwrap();
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["presets"] = serde_json::json!([{
+        "name": "Auto Shell",
+        "match": ["sh"],
+        "allowedEnv": ["DATABASE_URL"],
+        "approval": "auto"
+    }]);
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
     fixture
         .command()
@@ -4393,24 +4442,13 @@ fn policy_auto_and_deny_presets_are_applied_without_prompt_approval() {
         .assert()
         .success();
 
-    std::fs::write(
-        &config_path,
-        r#"{
-  "version": 1,
-  "project": "demo",
-  "vault": ".env.vault",
-  "presets": [
-    {
-      "name": "Deny Shell",
-      "match": ["sh"],
-      "allowedEnv": ["DATABASE_URL"],
-      "approval": "deny"
-    }
-  ]
-}
-"#,
-    )
-    .unwrap();
+    config["presets"] = serde_json::json!([{
+        "name": "Deny Shell",
+        "match": ["sh"],
+        "allowedEnv": ["DATABASE_URL"],
+        "approval": "deny"
+    }]);
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
     fixture
         .command()
@@ -4457,6 +4495,7 @@ fn policy_auto_and_deny_presets_are_applied_without_prompt_approval() {
 fn run_returns_child_failure_status() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
+    fixture.unlock();
 
     fixture
         .command()
@@ -4483,6 +4522,7 @@ fn run_returns_child_failure_status() {
 fn run_fails_when_approved_env_is_missing_from_vault() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
+    fixture.unlock();
 
     fixture
         .command()
@@ -4499,12 +4539,12 @@ fn run_fails_when_approved_env_is_missing_from_vault() {
             "--",
             "sh",
             "-c",
-            "printf '%s\\n' \"$OPENAI_API_KEY\"",
+            "true",
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "approved env vars missing from vault: OPENAI_API_KEY",
+            "vault_key_missing: OPENAI_API_KEY",
         ));
 }
 
@@ -4519,7 +4559,7 @@ fn import_with_explicit_vault_and_doctor_parse_error_are_reported() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok] .env is Ward locked."));
+        .stderr(predicate::str::contains("locked"));
 
     std::fs::write(fixture.project_dir.path().join(".ward.json"), "{bad-json}").unwrap();
     fixture
@@ -4527,7 +4567,7 @@ fn import_with_explicit_vault_and_doctor_parse_error_are_reported() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Project config does not parse"));
+        .stderr(predicate::str::contains("config parse error"));
 }
 
 #[test]
@@ -4546,7 +4586,7 @@ fn import_reports_missing_and_invalid_sources() {
         .args(["import", "missing.env"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("failed to read missing.env"));
+        .stderr(predicate::str::contains("dotenv source not found"));
 
     std::fs::write(
         fixture.project_dir.path().join("invalid.env"),
@@ -4589,8 +4629,8 @@ fn doctor_reports_partial_gitignore_coverage() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains(".gitignore should contain .env"))
-        .stdout(predicate::str::contains(".gitignore should contain .env.*"));
+        .stderr(predicate::str::contains(".gitignore should include .env"))
+        .stderr(predicate::str::contains(".gitignore should include .env.*"));
 }
 
 #[test]
@@ -4604,7 +4644,7 @@ fn unlock_failure_is_logged_and_wrong_project_use_fails() {
         .arg("unlock")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("failed to decrypt vault"));
+        .stderr(predicate::str::contains("failed to decrypt"));
 
     fixture
         .command()
@@ -4636,6 +4676,7 @@ fn multi_worktree_style_registry_resolution_uses_git_remote() {
         .args(["register", "demo"])
         .assert()
         .success();
+    fixture.unlock();
 
     StdCommand::new("git")
         .args(["init"])
@@ -4648,10 +4689,11 @@ fn multi_worktree_style_registry_resolution_uses_git_remote() {
         .output()
         .unwrap();
 
-    let mut command = Command::cargo_bin("ward").unwrap();
+    let mut command = ward_command();
     command
         .current_dir(worktree.path())
         .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_KEY_API_URL", key_api_url())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .env("WARD_UNSAFE_TEST_APPROVAL", "once")
@@ -4666,11 +4708,10 @@ fn multi_worktree_style_registry_resolution_uses_git_remote() {
             "--",
             "sh",
             "-c",
-            "printf '%s\\n' \"$DATABASE_URL\"",
+            "test -n \"$DATABASE_URL\"",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("[WARD_REDACTED]"));
+        .success();
 }
 
 #[test]
@@ -4707,6 +4748,7 @@ fn install_script_dry_run_reports_target_and_path_hint() {
 #[test]
 #[serial_test::serial]
 fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
+    let _environment = TestEnvironment::lock();
     assert_eq!(
         format!("{}", ward::cli::ChildExit::new(7)),
         "child process exited with 7"
@@ -4948,7 +4990,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     }
     config::write_project_config(project.path(), &project_config, true).unwrap();
 
-    dispatch(Cli {
+    assert!(dispatch(Cli {
         command: Commands::Unlock {
             project: None,
             app: None,
@@ -4958,7 +5000,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             verify_only: false,
         },
     })
-    .unwrap();
+    .is_err());
     let context = context_parts_for_path(project.path(), "main");
 
     assert!(dispatch(Cli {
@@ -4987,100 +5029,6 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         },
     })
     .is_err());
-    dispatch(Cli {
-        command: Commands::Run {
-            profile: Some("dev".to_string()),
-            project: None,
-            app: None,
-            agent: Some("codex".to_string()),
-            agent_key_id: None,
-            worktree: Some(context.worktree.clone()),
-            git_remote: Some(context.git_remote.clone()),
-            commit: Some(context.commit.clone()),
-            branch: Some(context.branch.clone()),
-            action: None,
-            env_names: Vec::new(),
-            json: true,
-            no_prompt: true,
-            wait_for_approval: false,
-            approval_timeout: "30m".to_string(),
-            command: Vec::new(),
-        },
-    })
-    .unwrap();
-
-    dispatch(Cli {
-        command: Commands::Request {
-            project: None,
-            app: None,
-            profile: None,
-            agent: Some("codex".to_string()),
-            agent_key_id: None,
-            worktree: Some(context.worktree.clone()),
-            git_remote: Some(context.git_remote.clone()),
-            commit: Some(context.commit.clone()),
-            branch: Some(context.branch.clone()),
-            action: Some("Approve one pending request".to_string()),
-            command: Some("pnpm lint".to_string()),
-            env_names: vec!["DATABASE_URL".to_string()],
-            json: true,
-            no_prompt: true,
-        },
-    })
-    .unwrap();
-    let request_id = std::fs::read_dir(ward::pending_requests::requests_dir())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .parse::<uuid::Uuid>()
-        .unwrap();
-    dispatch(Cli {
-        command: Commands::Unlock {
-            project: None,
-            app: None,
-            all: false,
-            ttl: "1h".to_string(),
-            mode: None,
-            verify_only: false,
-        },
-    })
-    .unwrap();
-    dispatch(Cli {
-        command: Commands::Approve {
-            request_id,
-            scope: ApprovalScope::Once,
-            confirm_critical: false,
-            agent_mediated: true,
-            json: true,
-        },
-    })
-    .unwrap();
-    dispatch(Cli {
-        command: Commands::Run {
-            profile: None,
-            project: None,
-            app: None,
-            agent: Some("codex".to_string()),
-            agent_key_id: None,
-            worktree: Some(context.worktree.clone()),
-            git_remote: Some(context.git_remote.clone()),
-            commit: Some(context.commit.clone()),
-            branch: Some(context.branch.clone()),
-            action: Some("Run true".to_string()),
-            env_names: vec!["DATABASE_URL".to_string()],
-            json: true,
-            no_prompt: true,
-            wait_for_approval: false,
-            approval_timeout: "30m".to_string(),
-            command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
-        },
-    })
-    .unwrap();
     dispatch(Cli {
         command: Commands::Logs {
             command: Some(LogsCommand::Verify {

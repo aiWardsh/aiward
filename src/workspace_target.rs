@@ -517,7 +517,7 @@ fn mount_filter_command(
         anyhow::bail!("workspace app is missing package name or app slug");
     };
     let mut out = vec![binary.to_string(), "--filter".to_string(), selector];
-    if force_run && argv.get(1).map_or(true, |arg| arg != "run") {
+    if force_run && argv.get(1).is_none_or(|arg| arg != "run") {
         out.push("run".to_string());
     }
     out.extend(argv[1..].iter().cloned());

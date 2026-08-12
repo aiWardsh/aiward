@@ -196,11 +196,9 @@ mod tests {
         detection::Finding,
         policy::{AccessRequest, ApprovalMode, PolicyEvaluation},
     };
-    use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    fn env_lock() -> crate::test_support::TestEnvironment {
+        crate::test_support::TestEnvironment::lock()
     }
 
     fn access() -> AccessRequest {

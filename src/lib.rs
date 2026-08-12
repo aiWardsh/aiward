@@ -12,6 +12,7 @@ pub mod env_file;
 pub(crate) mod fs_util;
 pub mod git_context;
 pub mod global_disable;
+pub mod global_transition;
 pub mod grants;
 pub mod human;
 pub(crate) mod key_store;
@@ -26,6 +27,8 @@ pub mod recovery;
 pub mod registry;
 pub mod runner;
 pub mod term;
+#[cfg(any(test, debug_assertions))]
+pub mod test_support;
 pub mod unlock;
 pub mod vault;
 pub mod webui;

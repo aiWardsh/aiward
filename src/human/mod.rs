@@ -339,9 +339,9 @@ pub fn activate_human_mode(
         .spawn()
         .context("failed to spawn human guardian")?;
 
-    // Wait up to 3 seconds for ready-marker.
+    // Allow detached broker and guardian startup to settle on slower machines.
     let ready = ready_marker_path(shell_pid);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while !ready.exists() {
         if Instant::now() >= deadline {
             term::emit_block(&term::MessageBlock {

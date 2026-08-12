@@ -19,19 +19,23 @@ pub(crate) fn resolve_inside_base(base: &Path, candidate: &Path, label: &str) ->
     };
     let candidate_norm = normalize_lexical(&candidate_abs);
 
-    if !candidate_norm.starts_with(&base_norm) {
-        anyhow::bail!(
-            "{label} must stay inside {}; got {}",
-            base_norm.display(),
-            candidate.display()
-        );
-    }
-
     let base_real = base_norm
         .canonicalize()
         .unwrap_or_else(|_| base_norm.clone());
     let check_path = nearest_existing_path(&candidate_norm);
-    if let Ok(real_path) = check_path.canonicalize() {
+    let real_path = check_path.canonicalize().ok();
+    if !candidate_norm.starts_with(&base_norm)
+        && !real_path
+            .as_ref()
+            .is_some_and(|path| path.starts_with(&base_real))
+    {
+        anyhow::bail!(
+            "{label} must stay inside {}; got {}",
+            base_real.display(),
+            candidate.display()
+        );
+    }
+    if let Some(real_path) = real_path {
         if !real_path.starts_with(&base_real) {
             anyhow::bail!(
                 "{label} must stay inside {}; got {}",
