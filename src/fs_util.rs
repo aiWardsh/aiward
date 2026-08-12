@@ -19,11 +19,22 @@ pub(crate) fn resolve_inside_base(base: &Path, candidate: &Path, label: &str) ->
     };
     let candidate_norm = normalize_lexical(&candidate_abs);
 
-    let base_real = base_norm
+    let base_existing = nearest_existing_path(&base_norm);
+    let base_real = base_existing
         .canonicalize()
-        .unwrap_or_else(|_| base_norm.clone());
+        .ok()
+        .and_then(|real| {
+            base_norm
+                .strip_prefix(&base_existing)
+                .ok()
+                .map(|suffix| real.join(suffix))
+        })
+        .unwrap_or_else(|| base_norm.clone());
     let check_path = nearest_existing_path(&candidate_norm);
     let real_path = check_path.canonicalize().ok();
+    let existing_path_is_base_ancestor = real_path
+        .as_ref()
+        .is_some_and(|path| base_real.starts_with(path));
     if !candidate_norm.starts_with(&base_norm)
         && !real_path
             .as_ref()
@@ -36,7 +47,7 @@ pub(crate) fn resolve_inside_base(base: &Path, candidate: &Path, label: &str) ->
         );
     }
     if let Some(real_path) = real_path {
-        if !real_path.starts_with(&base_real) {
+        if !real_path.starts_with(&base_real) && !existing_path_is_base_ancestor {
             anyhow::bail!(
                 "{label} must stay inside {}; got {}",
                 base_real.display(),
@@ -344,6 +355,18 @@ mod tests {
 
         assert_eq!(relative, nested.join(".env.vault"));
         assert_eq!(absolute, nested.join(".env.vault"));
+    }
+
+    #[test]
+    fn resolve_inside_base_accepts_children_before_base_exists() {
+        let parent = tempfile::tempdir().unwrap();
+        let base = parent.path().join("not-created-yet");
+
+        let resolved =
+            resolve_inside_base(&base, Path::new("run/ward.sock"), "runtime path").unwrap();
+
+        assert_eq!(resolved, base.join("run/ward.sock"));
+        assert!(!base.exists());
     }
 
     #[test]
