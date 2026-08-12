@@ -282,7 +282,7 @@ fn decrypt_entry(entry: &EncryptedLogEntry, key: &[u8; KEY_LEN]) -> Result<Value
 
 fn last_entry(path: &Path) -> Result<Option<EncryptedLogEntry>> {
     let entries = read_entries(path)?;
-    Ok(entries.into_iter().last())
+    Ok(entries.into_iter().next_back())
 }
 
 fn read_entries(path: &Path) -> Result<Vec<EncryptedLogEntry>> {
