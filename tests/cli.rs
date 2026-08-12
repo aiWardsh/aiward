@@ -3845,6 +3845,8 @@ fn doctor_reports_encrypted_anomaly_alert_counts_without_decrypting() {
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config["anomalyDetection"]["maxRunsPerHourPerGrant"] = serde_json::json!(0);
+    config["anomalyDetection"]["workingHoursStart"] = serde_json::json!(0);
+    config["anomalyDetection"]["workingHoursEnd"] = serde_json::json!(0);
     std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
     fixture
